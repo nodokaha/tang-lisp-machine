@@ -1,0 +1,7 @@
+# build artifacts (regenerable from sources)
+*.fs
+*.bin
+*.elf
+*.log
+*.json
+__pycache__/
