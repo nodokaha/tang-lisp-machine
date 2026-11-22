@@ -1,7 +1,17 @@
-// TangLisp v2+SD -- TangLisp v2 with an SD/FAT32 boot stage (Stage 3b).
+// TangLisp v2+SD -- TangLisp v2 with an SD/FAT32 boot stage.
 // At boot, after the environment is built, the firmware mounts a FAT32
-// card over the SoC SPI master, lists the root directory, and evaluates
-// AUTOEXEC.LSP if present. Without a card it falls through to the REPL.
+// card over the SoC SPI master, lists the root directory, restores the
+// heap image from HEAPIMG.BIN if a valid one exists (Stage 3c), and
+// otherwise evaluates AUTOEXEC.LSP if present. The (save) primitive
+// writes the current heap back to HEAPIMG.BIN. The (load NAME)
+// primitive evaluates any root-directory file on the card, e.g.
+// (load LIB.LSP); nested loads are not supported. Byte arrays
+// (make-bytes / bytes-ref / bytes-set! / bytes-length / bytes?) live
+// in a small static arena as the foundation for writing drivers in
+// Lisp. peek/poke and spi-cs/spi-fast/spi-byte expose the hardware
+// to Lisp itself (with ash/logand/logior for bit work), and
+// SDREAD.LSP is a working SD driver written in TangLisp on top of
+// them. Without a card the firmware falls through to the REPL.
 // v2 adds set! and proper tail calls: eval is a trampoline loop, so a
 // call in tail position (if branches, last body form, let/begin tail)
 // reuses the same C frame instead of growing the stack.
@@ -84,11 +94,13 @@ static void putnum(int n)
 }
 
 
-// ---------- SD card (SPI mode, read-only) + FAT32 reader ----------
+// ---------- SD card (SPI mode) + FAT32 reader/writer ----------
 // The low-level part between SDLOW_BEGIN/SDLOW_END is the only piece
 // that touches the SPI hardware; the host test build swaps it for a
-// disk-image-backed version. Everything FAT uses just sd_init() and
-// sd_read_block().
+// disk-image-backed version. Everything FAT uses just sd_init(),
+// sd_read_block() and sd_write_block(). Writing is limited to
+// overwriting the blocks of a pre-allocated HEAPIMG.BIN (Stage 3c);
+// no FAT allocation or directory creation is implemented.
 static void puthex8(unsigned v)
 {
     static const char hexd[] = "0123456789ABCDEF";
@@ -130,6 +142,13 @@ static unsigned char spi_xfer(unsigned char b)
     while (SPI_STAT & 1u) { }
     return (unsigned char)(SPI_DATA & 0xFFu);
 }
+// Lisp-facing glue (inside SDLOW so the host build can swap in an
+// emulated SD card at the SPI byte level).
+static int lisp_peek(unsigned addr) { return (int)*(volatile unsigned *)addr; }
+static void lisp_poke(unsigned addr, unsigned v) { *(volatile unsigned *)addr = v; }
+static void lisp_spi_cs(int a) { sd_cs(a); }
+static void lisp_spi_fast(int f) { spi_set_fast(f); }
+static int lisp_spi_byte(int b) { return (int)spi_xfer((unsigned char)b); }
 static unsigned char sd_send_cmd(unsigned idx, unsigned arg, unsigned crc)
 {
     unsigned char r = 0xFF;
@@ -234,6 +253,32 @@ static int sd_read_block(unsigned lba, unsigned char *buf)
     spi_xfer(0xFF);
     return 0;
 }
+// 0 = ok. CMD24 single-block write: data token 0xFE, 512 bytes,
+// dummy CRC, then the data-response token (low 5 bits must be
+// 00101 = accepted) and a busy wait while the card programs the
+// block (MISO reads 0x00). Bounded polling throughout.
+static int sd_write_block(unsigned lba, const unsigned char *buf)
+{
+    unsigned char r, resp;
+    unsigned n = 0;
+    int i;
+    sd_cs(1);
+    r = sd_send_cmd(24, sd_ccs ? lba : (lba << 9), 0xFF);
+    if (r != 0x00) { sd_cs(0); return -1; }
+    spi_xfer(0xFF);
+    spi_xfer(0xFE);
+    for (i = 0; i < 512; i++) spi_xfer(buf[i]);
+    spi_xfer(0xFF);
+    spi_xfer(0xFF);
+    resp = spi_xfer(0xFF);
+    if ((resp & 0x1Fu) != 0x05u) { sd_cs(0); spi_xfer(0xFF); return -1; }
+    while (spi_xfer(0xFF) == 0x00) {
+        if (++n > 1000000u) { sd_cs(0); spi_xfer(0xFF); return -1; }
+    }
+    sd_cs(0);
+    spi_xfer(0xFF);
+    return 0;
+}
 /*SDLOW_END*/
 
 // ---------- FAT32 (read-only) ----------
@@ -241,8 +286,11 @@ static unsigned char blk[512];
 static unsigned fat_part_lba, fat_begin, fat_data_begin;
 static unsigned fat_spc, fat_root_cluster;
 static unsigned auto_cluster, auto_size;
-#define AUTOBUF_SIZE 2048
+static unsigned heap_cluster, heap_size;
+#define AUTOBUF_SIZE 1280
 static unsigned char autobuf[AUTOBUF_SIZE];
+static unsigned char loadbuf[AUTOBUF_SIZE];
+static int sd_mounted = 0;
 
 static unsigned rd16(const unsigned char *p)
 {
@@ -339,6 +387,8 @@ static unsigned fat_scan_root(void)
     int guard = 0;
     auto_cluster = 0;
     auto_size = 0;
+    heap_cluster = 0;
+    heap_size = 0;
     puts_("--- root directory ---\n");
     while (c >= 2 && c < 0x0FFFFFF8u && guard++ < 10000) {
         unsigned s;
@@ -360,6 +410,13 @@ static unsigned fat_scan_root(void)
                     found = (rd16(e + 20) << 16) | rd16(e + 26);
                     auto_size = rd32(e + 28);
                 }
+                match = 1;
+                for (i = 0; i < 11; i++)
+                    if (e[i] != (unsigned char)"HEAPIMG BIN"[i]) match = 0;
+                if (match && !(e[11] & 0x10)) {
+                    heap_cluster = (rd16(e + 20) << 16) | rd16(e + 26);
+                    heap_size = rd32(e + 28);
+                }
             }
             if (stop) return found;
         }
@@ -367,9 +424,10 @@ static unsigned fat_scan_root(void)
     }
     return found;
 }
-static int fat_load(unsigned first_cluster, unsigned size)
+static int fat_load_buf(unsigned first_cluster, unsigned size,
+                        unsigned char *buf, unsigned bufsize)
 {
-    unsigned want = size < (AUTOBUF_SIZE - 1) ? size : (AUTOBUF_SIZE - 1);
+    unsigned want = size < (bufsize - 1) ? size : (bufsize - 1);
     unsigned loaded = 0;
     unsigned c = first_cluster;
     int guard = 0;
@@ -379,13 +437,65 @@ static int fat_load(unsigned first_cluster, unsigned size)
             unsigned take, i;
             if (sd_read_block(cluster_lba(c) + s, blk) != 0) return -1;
             take = want - loaded < 512 ? want - loaded : 512;
-            for (i = 0; i < take; i++) autobuf[loaded + i] = blk[i];
+            for (i = 0; i < take; i++) buf[loaded + i] = blk[i];
             loaded += take;
         }
         c = fat_next(c);
     }
-    autobuf[loaded] = 0;
+    buf[loaded] = 0;
     return (int)loaded;
+}
+// Find a file in the root directory by its 11-char 8.3 name.
+// Returns the first cluster (0 = not found) and sets *size_out.
+static unsigned fat_find(const char *name83, unsigned *size_out)
+{
+    unsigned c = fat_root_cluster;
+    int guard = 0;
+    while (c >= 2 && c < 0x0FFFFFF8u && guard++ < 10000) {
+        unsigned s;
+        for (s = 0; s < fat_spc; s++) {
+            int off;
+            if (sd_read_block(cluster_lba(c) + s, blk) != 0) return 0;
+            for (off = 0; off < 512; off += 32) {
+                const unsigned char *e = blk + off;
+                int i, match;
+                if (e[0] == 0x00) return 0;
+                if (e[0] == 0xE5) continue;
+                if (e[11] == 0x0F) continue;
+                if (e[11] & 0x18) continue; // label or directory
+                match = 1;
+                for (i = 0; i < 11; i++)
+                    if (e[i] != (unsigned char)name83[i]) match = 0;
+                if (match) {
+                    *size_out = rd32(e + 28);
+                    return (rd16(e + 20) << 16) | rd16(e + 26);
+                }
+            }
+        }
+        c = fat_next(c);
+    }
+    return 0;
+}
+
+// Sequential block walker over a file's cluster chain (Stage 3c).
+// img_walk_next() returns the LBA of the current block and advances.
+// Note it may call fat_next(), which reuses blk[] as scratch -- so
+// callers must fetch the LBA before filling/reading blk[].
+struct ImgWalk { unsigned cluster; unsigned sec; };
+static void img_walk_init(struct ImgWalk *w, unsigned first)
+{
+    w->cluster = first;
+    w->sec = 0;
+}
+static unsigned img_walk_next(struct ImgWalk *w)
+{
+    unsigned lba = cluster_lba(w->cluster) + w->sec;
+    w->sec++;
+    if (w->sec >= fat_spc) {
+        w->sec = 0;
+        w->cluster = fat_next(w->cluster);
+    }
+    return lba;
 }
 
 // ---------- values ----------
@@ -404,7 +514,7 @@ static val mk_int(int n)  { return (n << 1) | 1; }
 static int int_val(val v) { return v >> 1; }
 
 struct Cell { val car, cdr; };
-#define NCELLS 1200
+#define NCELLS 950
 static struct Cell cells[NCELLS];
 static val car(val v) { return ((struct Cell *)v)->car; }
 static val cdr(val v) { return ((struct Cell *)v)->cdr; }
@@ -488,7 +598,7 @@ struct Sym { char name[16]; };
 static struct Sym symtab[NSYMS] __attribute__((aligned(8)));
 static int nsyms = 0;
 static val sym_t, sym_quote, sym_if, sym_lambda, sym_define, sym_let,
-           sym_begin, sym_closure, sym_set;
+           sym_begin, sym_closure, sym_set, sym_load;
 
 static int streq(const char *a, const char *b)
 {
@@ -507,6 +617,35 @@ static val intern(const char *name)
 }
 static const char *sym_name(val v) { return ((struct Sym *)(v & ~7))->name; }
 
+// ---------- byte arrays ----------
+// (v & 7) == 4 -> byte array: pointer to a header { int len; } followed
+// by len bytes, bump-allocated from a static arena. The arena is never
+// reclaimed (v1) and is NOT part of the heap image, so byte arrays do
+// not survive (save)/restore. 512 bytes hold one SD block -- the shape
+// future SPI-driver work in Lisp needs.
+static int is_bytes(val v) { return v != 0 && (v & 7) == 4; }
+#define BYTES_ARENA_SIZE 528 // one 512-byte block + header, 8-aligned
+static unsigned char bytes_arena[BYTES_ARENA_SIZE] __attribute__((aligned(8)));
+static int bytes_used = 0;
+static int bytes_len(val v) { return *(int *)(v & ~7); }
+static unsigned char *bytes_data(val v) { return (unsigned char *)(v & ~7) + 4; }
+static val make_bytes_obj(int n, int fill)
+{
+    int need, i;
+    unsigned char *p;
+    if (n < 0) { error_("make-bytes: negative size"); return NIL; }
+    need = (4 + n + 7) & ~7; // 8-aligned: the tag lives in the low 3 bits
+    if (bytes_used + need > BYTES_ARENA_SIZE) {
+        error_("make-bytes: arena full");
+        return NIL;
+    }
+    p = bytes_arena + bytes_used;
+    bytes_used += need;
+    *(int *)p = n;
+    for (i = 0; i < n; i++) p[4 + i] = (unsigned char)fill;
+    return (val)p | 4;
+}
+
 // ---------- printer ----------
 static void print_val(val v)
 {
@@ -515,6 +654,12 @@ static void print_val(val v)
     if (is_int(v)) { putnum(int_val(v)); return; }
     if (is_sym(v)) { puts_(sym_name(v)); return; }
     if (is_prim(v)) { puts_("#<prim>"); return; }
+    if (is_bytes(v)) {
+        puts_("#<bytes ");
+        putnum(bytes_len(v));
+        putc_('>');
+        return;
+    }
     if (is_cons(v)) {
         if (car(v) == sym_closure) { puts_("#<closure>"); return; }
         putc_('(');
@@ -680,6 +825,24 @@ static val eval_list(val exprs, val env)
 #define PRIM_NOT 12
 #define PRIM_LIST 13
 #define PRIM_PRINT 14
+#define PRIM_SAVE 15
+#define PRIM_LOAD 16
+#define PRIM_MAKE_BYTES 17
+#define PRIM_BYTES_REF 18
+#define PRIM_BYTES_SET 19
+#define PRIM_BYTES_LEN 20
+#define PRIM_BYTES_P 21
+#define PRIM_PEEK 22
+#define PRIM_POKE 23
+#define PRIM_SPI_CS 24
+#define PRIM_SPI_FAST 25
+#define PRIM_SPI_BYTE 26
+#define PRIM_ASH 27
+#define PRIM_LOGAND 28
+#define PRIM_LOGIOR 29
+static val prim_load(const char *name);
+
+static int heap_save(void); // defined below, with the SD boot stage
 
 static val apply_prim(int idx, val args)
 {
@@ -744,6 +907,79 @@ static val apply_prim(int idx, val args)
         print_val(a);
         putc_('\n');
         return a;
+    case PRIM_SAVE:
+        return heap_save() == 0 ? sym_t : NIL;
+    case PRIM_LOAD:
+        a = is_cons(args) ? car(args) : NIL;
+        if (!is_sym(a)) { error_("load: need a file name symbol"); return NIL; }
+        return prim_load(sym_name(a));
+    case PRIM_MAKE_BYTES: {
+        int n, fill = 0;
+        if (!is_cons(args)) { error_("bad args"); return NIL; }
+        n = int_val(car(args));
+        if (is_cons(cdr(args))) fill = int_val(car(cdr(args)));
+        return make_bytes_obj(n, fill);
+    }
+    case PRIM_BYTES_REF: {
+        int i;
+        if (!is_cons(args) || !is_cons(cdr(args))) { error_("bad args"); return NIL; }
+        a = car(args);
+        if (!is_bytes(a)) { error_("bytes-ref: not bytes"); return NIL; }
+        i = int_val(car(cdr(args)));
+        if (i < 0 || i >= bytes_len(a)) { error_("bytes-ref: out of range"); return NIL; }
+        return mk_int(bytes_data(a)[i]);
+    }
+    case PRIM_BYTES_SET: {
+        int i, x;
+        if (!is_cons(args) || !is_cons(cdr(args)) || !is_cons(cdr(cdr(args)))) {
+            error_("bad args"); return NIL;
+        }
+        a = car(args);
+        if (!is_bytes(a)) { error_("bytes-set!: not bytes"); return NIL; }
+        i = int_val(car(cdr(args)));
+        x = int_val(car(cdr(cdr(args))));
+        if (i < 0 || i >= bytes_len(a)) { error_("bytes-set!: out of range"); return NIL; }
+        bytes_data(a)[i] = (unsigned char)x;
+        return mk_int(x & 0xFF);
+    }
+    case PRIM_BYTES_LEN:
+        a = is_cons(args) ? car(args) : NIL;
+        if (!is_bytes(a)) { error_("bytes-length: not bytes"); return NIL; }
+        return mk_int(bytes_len(a));
+    case PRIM_BYTES_P:
+        return (is_cons(args) && is_bytes(car(args))) ? sym_t : NIL;
+    case PRIM_PEEK:
+        if (!is_cons(args)) { error_("bad args"); return NIL; }
+        return mk_int(lisp_peek((unsigned)int_val(car(args))));
+    case PRIM_POKE:
+        if (!is_cons(args) || !is_cons(cdr(args))) { error_("bad args"); return NIL; }
+        lisp_poke((unsigned)int_val(car(args)), (unsigned)int_val(car(cdr(args))));
+        return car(cdr(args));
+    case PRIM_SPI_CS:
+        if (!is_cons(args)) { error_("bad args"); return NIL; }
+        lisp_spi_cs(int_val(car(args)) != 0);
+        return sym_t;
+    case PRIM_SPI_FAST:
+        if (!is_cons(args)) { error_("bad args"); return NIL; }
+        lisp_spi_fast(int_val(car(args)) != 0);
+        return sym_t;
+    case PRIM_SPI_BYTE:
+        if (!is_cons(args)) { error_("bad args"); return NIL; }
+        return mk_int(lisp_spi_byte(int_val(car(args))));
+    case PRIM_ASH: {
+        int n, k;
+        if (!is_cons(args) || !is_cons(cdr(args))) { error_("bad args"); return NIL; }
+        n = int_val(car(args));
+        k = int_val(car(cdr(args)));
+        if (k > 31 || k < -31) { error_("ash: shift too large"); return NIL; }
+        return mk_int(k >= 0 ? (n << k) : (n >> -k));
+    }
+    case PRIM_LOGAND:
+        if (!is_cons(args) || !is_cons(cdr(args))) { error_("bad args"); return NIL; }
+        return mk_int(int_val(car(args)) & int_val(car(cdr(args))));
+    case PRIM_LOGIOR:
+        if (!is_cons(args) || !is_cons(cdr(args))) { error_("bad args"); return NIL; }
+        return mk_int(int_val(car(args)) | int_val(car(cdr(args))));
     }
     error_("bad primitive");
     return NIL;
@@ -912,6 +1148,15 @@ static val eval(val e, val env)
             e = v;
             break;
         }
+        if (head == sym_load) {
+            // (load NAME) -- NAME is a literal symbol (a file name such
+            // as LIB.LSP), not evaluated. The primitive of the same name
+            // also accepts a quoted symbol: (load 'LIB.LSP).
+            val target = car(cdr(e));
+            if (!is_sym(target)) { error_("load: need a file name"); break; }
+            e = prim_load(sym_name(target));
+            break;
+        }
         if (head == sym_let) {
             val binds = car(cdr(e));
             val newenv = env;
@@ -999,7 +1244,219 @@ static val eval(val e, val env)
 }
 
 
-// ---------- SD boot stage: mount, list root, run AUTOEXEC.LSP ----------
+// ---------- Stage 3c: heap image save / restore ----------
+// HEAPIMG.BIN layout (512-byte blocks, all integers little-endian):
+//   block 0     header: "TLHP", version(1), used-cell count, nsyms,
+//               genv, payload checksum (plain byte sum), payload size
+//   block 1..   payload: raw bytes of cells[], symtab[], usedbits[]
+//               concatenated and zero-padded to a block boundary.
+// Cells and symbols contain raw pointers, so an image is only valid
+// for the exact same firmware binary and memory layout. The file
+// must already exist on the card with at least IMG_FILE_BYTES bytes
+// allocated; (save) only overwrites its existing cluster chain.
+#define IMG_PAYLOAD_BYTES ((unsigned)sizeof(cells) + (unsigned)sizeof(symtab) + \
+                           (unsigned)sizeof(usedbits))
+#define IMG_TOTAL_BLOCKS (1u + ((IMG_PAYLOAD_BYTES + 511u) >> 9))
+#define IMG_FILE_BYTES (IMG_TOTAL_BLOCKS << 9)
+#define IMG_VERSION 3u // bumped on every layout change (2: (load) build, 3: SPI prims build)
+
+static void wr32(unsigned char *p, unsigned v)
+{
+    p[0] = (unsigned char)v;
+    p[1] = (unsigned char)(v >> 8);
+    p[2] = (unsigned char)(v >> 16);
+    p[3] = (unsigned char)(v >> 24);
+}
+
+// Byte-stream cursor over the three payload regions, used both as
+// the source on save and as the destination on restore.
+static unsigned char *img_reg[3];
+static unsigned img_reg_len[3];
+static unsigned cur_reg, cur_off;
+static void img_cursor_init(void)
+{
+    img_reg[0] = (unsigned char *)cells;   img_reg_len[0] = (unsigned)sizeof(cells);
+    img_reg[1] = (unsigned char *)symtab;  img_reg_len[1] = (unsigned)sizeof(symtab);
+    img_reg[2] = (unsigned char *)usedbits; img_reg_len[2] = (unsigned)sizeof(usedbits);
+    cur_reg = 0;
+    cur_off = 0;
+}
+static int img_src_byte(void)
+{
+    int b;
+    if (cur_reg >= 3) return 0;
+    b = img_reg[cur_reg][cur_off++];
+    if (cur_off >= img_reg_len[cur_reg]) { cur_reg++; cur_off = 0; }
+    return b;
+}
+static void img_dst_byte(unsigned char b)
+{
+    if (cur_reg >= 3) return;
+    img_reg[cur_reg][cur_off++] = b;
+    if (cur_off >= img_reg_len[cur_reg]) { cur_reg++; cur_off = 0; }
+}
+static int heap_file_ok(void)
+{
+    if (!heap_cluster) return 0;
+    if (((heap_size + 511u) >> 9) < IMG_TOTAL_BLOCKS) return 0;
+    return 1;
+}
+
+static int heap_save(void)
+{
+    struct ImgWalk w;
+    unsigned cksum = 0, used = 0, produced;
+    unsigned b, i;
+    if (!heap_cluster) { puts_("save: HEAPIMG.BIN not found\n"); return -1; }
+    if (!heap_file_ok()) { puts_("save: HEAPIMG.BIN too small\n"); return -1; }
+    img_cursor_init();
+    for (b = 0; b < 3; b++)
+        for (i = 0; i < img_reg_len[b]; i++)
+            cksum += img_reg[b][i];
+    for (i = 0; i < (unsigned)NWORDS; i++) {
+        unsigned x = usedbits[i];
+        while (x) { used += x & 1u; x >>= 1; }
+    }
+    img_walk_init(&w, heap_cluster);
+    produced = 0;
+    for (b = 0; b < IMG_TOTAL_BLOCKS; b++) {
+        unsigned lba = img_walk_next(&w); // before touching blk[]
+        if (b == 0) {
+            for (i = 0; i < 512; i++) blk[i] = 0;
+            blk[0] = 'T'; blk[1] = 'L'; blk[2] = 'H'; blk[3] = 'P';
+            wr32(blk + 4, IMG_VERSION);
+            wr32(blk + 8, used);
+            wr32(blk + 12, (unsigned)nsyms);
+            wr32(blk + 16, (unsigned)genv);
+            wr32(blk + 20, cksum);
+            wr32(blk + 24, IMG_PAYLOAD_BYTES);
+        } else {
+            for (i = 0; i < 512; i++) {
+                blk[i] = (unsigned char)(produced < IMG_PAYLOAD_BYTES
+                                         ? img_src_byte() : 0);
+                if (produced < IMG_PAYLOAD_BYTES) produced++;
+            }
+        }
+        if (sd_write_block(lba, blk) != 0) {
+            puts_("save: block write failed\n");
+            return -1;
+        }
+    }
+    puts_("save: heap image written to HEAPIMG.BIN\n");
+    return 0;
+}
+
+// 0 = image restored (cells/symtab/usedbits/nsyms/genv overwritten,
+// freelist rebuilt by one gc). -1 = no valid image; caller falls
+// back to the AUTOEXEC path and nothing has been modified.
+static int heap_restore(void)
+{
+    struct ImgWalk w;
+    unsigned saved_nsyms, saved_genv, saved_cksum, payload;
+    unsigned cksum, remaining, consumed;
+    unsigned b, i, lba;
+    if (!heap_file_ok()) return -1;
+    img_walk_init(&w, heap_cluster);
+    lba = img_walk_next(&w);
+    if (sd_read_block(lba, blk) != 0) return -1;
+    if (blk[0] != 'T' || blk[1] != 'L' || blk[2] != 'H' || blk[3] != 'P')
+        return -1;
+    if (rd32(blk + 4) != IMG_VERSION) return -1;
+    payload = rd32(blk + 24);
+    if (payload != IMG_PAYLOAD_BYTES) return -1;
+    saved_nsyms = rd32(blk + 12);
+    if (saved_nsyms > (unsigned)NSYMS) return -1;
+    saved_genv = rd32(blk + 16);
+    saved_cksum = rd32(blk + 20);
+    // Pass 1: verify the checksum over the stored payload.
+    cksum = 0;
+    remaining = payload;
+    for (b = 1; b < IMG_TOTAL_BLOCKS; b++) {
+        lba = img_walk_next(&w);
+        if (sd_read_block(lba, blk) != 0) return -1;
+        for (i = 0; i < 512 && remaining; i++, remaining--)
+            cksum += blk[i];
+    }
+    if (cksum != saved_cksum) {
+        puts_("HEAPIMG: checksum mismatch -- ignoring image\n");
+        return -1;
+    }
+    // Pass 2: copy the payload into place.
+    img_cursor_init();
+    img_walk_init(&w, heap_cluster);
+    img_walk_next(&w); // skip header
+    consumed = 0;
+    for (b = 1; b < IMG_TOTAL_BLOCKS; b++) {
+        lba = img_walk_next(&w);
+        if (sd_read_block(lba, blk) != 0) return -1;
+        for (i = 0; i < 512 && consumed < payload; i++, consumed++)
+            img_dst_byte(blk[i]);
+    }
+    nsyms = (int)saved_nsyms;
+    genv = (val)saved_genv;
+    gc(); // rebuild freelist from restored usedbits + reachability
+    return 0;
+}
+
+// ---------- (load NAME): evaluate a file from the SD root ----------
+// The name is a symbol such as LIB.LSP (case-insensitive, 8.3). The
+// file is read into loadbuf (separate from autobuf, so AUTOEXEC may
+// itself call load), parsed and evaluated form by form in the global
+// environment, and the last value is returned. A load already in
+// progress rejects nested loads, because loadbuf would be clobbered.
+static int load_active = 0;
+static val prim_load(const char *name)
+{
+    char n83[12];
+    unsigned cluster, size;
+    int n, i, dot = -1, ni = 0;
+    const char *saved_rp;
+    val last = NIL;
+    for (i = 0; i < 11; i++) n83[i] = ' ';
+    n83[11] = 0;
+    for (i = 0; name[i]; i++) {
+        char c = name[i];
+        if (c >= 'a' && c <= 'z') c = (char)(c - 'a' + 'A');
+        if (c == '.') {
+            if (dot >= 0) { error_("load: bad name"); return NIL; }
+            dot = i;
+            continue;
+        }
+        if (dot < 0) {
+            if (ni >= 8) { error_("load: name too long"); return NIL; }
+            n83[ni++] = c;
+        } else {
+            int ei = i - dot - 1;
+            if (ei >= 3) { error_("load: ext too long"); return NIL; }
+            n83[8 + ei] = c;
+        }
+    }
+    if (ni == 0) { error_("load: bad name"); return NIL; }
+    if (!sd_mounted) { error_("load: SD unavailable"); return NIL; }
+    if (load_active) { error_("load: nested load not supported"); return NIL; }
+    cluster = fat_find(n83, &size);
+    if (!cluster) { error_("load: file not found"); return NIL; }
+    n = fat_load_buf(cluster, size, loadbuf, AUTOBUF_SIZE);
+    if (n <= 0) { error_("load: read failed"); return NIL; }
+    load_active = 1;
+    saved_rp = rp;
+    rp = (const char *)loadbuf;
+    for (;;) {
+        val e, r;
+        skip_ws();
+        if (*rp == 0) break;
+        e = parse_val();
+        if (lisp_err) break;
+        r = eval(e, genv);
+        if (lisp_err) break;
+        last = r;
+    }
+    rp = saved_rp;
+    load_active = 0;
+    return lisp_err ? NIL : last;
+}
+
+// ---------- SD boot stage: mount, list root, restore or AUTOEXEC ----------
 static void sd_boot(void)
 {
     unsigned fc;
@@ -1008,7 +1465,12 @@ static void sd_boot(void)
         puts_("SD: unavailable -- starting REPL only\n");
         return;
     }
+    sd_mounted = 1;
     fc = fat_scan_root();
+    if (heap_cluster && heap_restore() == 0) {
+        puts_("HEAPIMG restored\n");
+        return;
+    }
     if (!fc) {
         puts_("AUTOEXEC.LSP not found\n");
         return;
@@ -1017,7 +1479,7 @@ static void sd_boot(void)
     puts_("AUTOEXEC.LSP found, ");
     putnum((int)auto_size);
     puts_(" bytes\n");
-    n = fat_load(fc, auto_size);
+    n = fat_load_buf(fc, auto_size, autobuf, AUTOBUF_SIZE);
     if (n <= 0) { puts_("AUTOEXEC.LSP load failed\n"); return; }
     rp = (const char *)autobuf;
     for (;;) {
@@ -1073,7 +1535,10 @@ static int paren_balance(const char *s)
 
 static const char *prim_names[] = {
     "+", "-", "*", "=", "<", ">", "cons", "car", "cdr",
-    "null?", "pair?", "eq?", "not", "list", "print", 0
+    "null?", "pair?", "eq?", "not", "list", "print", "save", "load",
+    "make-bytes", "bytes-ref", "bytes-set!", "bytes-length", "bytes?",
+    "peek", "poke", "spi-cs", "spi-fast", "spi-byte", "ash",
+    "logand", "logior", 0
 };
 
 int main(void)
@@ -1092,6 +1557,7 @@ int main(void)
     sym_let = intern("let");
     sym_begin = intern("begin");
     sym_set = intern("set!");
+    sym_load = intern("load");
     sym_closure = intern("*closure*");
     genv = cons(cons(sym_t, sym_t), NIL);
     for (i = 0; prim_names[i]; i++) {

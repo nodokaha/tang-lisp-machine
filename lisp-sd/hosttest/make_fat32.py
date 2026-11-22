@@ -67,6 +67,10 @@ fat_set(0, 0xFFFFFFF8)
 fat_set(1, 0xFFFFFFFF)
 for c in (2, 3, 4):
     fat_set(c, 0x0FFFFFFF)
+# HEAPIMG.BIN chain: clusters 5..10 (6 * 2 KiB = 12288 bytes)
+for c in range(5, 10):
+    fat_set(c, c + 1)
+fat_set(10, 0x0FFFFFFF)
 for f in range(NFATS):
     for s in range(fatsz):
         put_sec(fat_begin + f*fatsz + s, fat[s*SECTOR:(s+1)*SECTOR])
@@ -114,6 +118,7 @@ root[32:64] = lfn                                                 # LFN (skip)
 root[64:96] = entry(b"DELETED TXT", 0x20, 5, 123, first=0xE5)     # deleted (skip)
 root[96:128] = entry(b"AUTOEXECLSP", 0x20, 3, len(autoexec))
 root[128:160] = entry(b"DUMMY   TXT", 0x20, 4, 5)
+root[160:192] = entry(b"HEAPIMG BIN", 0x20, 5, 12288)   # zero-filled clusters 5..10
 # rest zeros = end marker
 for s in range(SPC):
     put_sec(clus_lba(2) + s, root[s*SECTOR:(s+1)*SECTOR])
