@@ -8,18 +8,20 @@
 ## 連載（Qiita）
 
 - 第1回：[スマホだけで FPGA に Lisp マシンを作った話（Tang Primer 25K＋自作JTAG＋PicoRV32）](https://qiita.com/nodokaha/items/54e0f4032e887c0f95dd)（原稿：`articles/01-tang-lisp.md`）
-- 第2回以降の候補：LiteX 移行と BIOS シリアルブート、SDRAM モジュールでヒープ拡張、ハードウェア Lisp CPU（本道）。設計メモは `LISP-MACHINE.md`
+- 第2回：FPGA の Lisp マシンが SD カードから起動するようになった話 https://qiita.com/nodokaha/items/bd831f225b961f7ebf6b （原稿：`articles/02-tang-lisp-sd.md`、2026-11-22 公開）
+- 第3回以降の候補：ヒープイメージの保存／復元、ネットワーク（WiFi＋ssh）、ハードウェア Lisp CPU（本道）。設計メモは `LISP-MACHINE.md`
 
 ## 構成
 
 - `lisp/` — SoC とファームウェア
   - `soc.v`：PicoRV32＋32KB RAM＋UART の最小 SoC
   - `regs_ff.v`：Version A（分散 RAM なし）向けの FF 版レジスタファイル
-  - `lisp.c`：TangLisp v1 本体（reader／eval／クロージャ／mark-sweep GC）
+  - `lisp.c`：TangLisp v2 本体（reader／eval／クロージャ／mark-sweep GC／`set!`／末尾再帰最適化）
   - `fw_echo.c`：胚（エコーファーム）、`crt0.S`、`link.ld`、`tang_lisp.cst`
   - `picorv32.v`：YosysHQ/picorv32（ISC License）
 - `phone/` — スマホ Termux 側のツール群
-  - `jtag30.py`：自作 JTAG ドライバ（BL616 の癖対策入り、SRAM 書き込み）
+  - `jtag30.py`：自作 JTAG ドライバ（BL616 の癖対策入り、SRAM 書き込み。v1 用）
+  - `jtag31.py`／`run-jtag31.sh`：v2 用の書き込みセット（jtag30 のコピー、PROG31 表記。スマホ側では新 `top.bin` を Termux ホームに置いて使う）
   - `uart_listen2.py`：UART 生死判定（DTR が要点）
   - `lisp.py`：ワンショット送信（send.txt 方式）、`lisp_test.py`：テスト 10 本
   - `lisp_repl.py`：対話 REPL（termux-usb 直結版）
@@ -30,13 +32,14 @@
 - `LISP-MACHINE.md` — 設計検討メモ
 - `articles/` — Qiita 原稿の置き場
 
-## TangLisp v1 の仕様（要約）
+## TangLisp v2 の仕様（要約）
 
 - 値：31bit fixnum、nil（= 空リスト、唯一の偽）、cons、シンボル（96 種・15 文字まで）、クロージャ
-- 特殊形式：`quote` `if` `lambda` `define`（関数糖衣・自己再帰可）`let`（並行束縛）`begin`
+- 特殊形式：`quote` `if` `lambda` `define`（関数糖衣・自己再帰可）`let`（並行束縛）`begin` `set!`
 - プリミティブ 15 個：`+` `-` `*` `=` `<` `>` `cons` `car` `cdr` `null?` `pair?` `eq?` `not` `list` `print`
 - GC：mark-sweep、ヒープ 1,400 セル、ルートスタック付きで評価中も回収可
-- 末尾再帰最適化なし、`set!` なし（コードはあるが未接続）
+- **末尾再帰最適化あり**（v2）：eval をトランポリン化し、末尾位置の呼び出しでは C スタックを伸ばさない。`set!` も接続済み（v1 では未接続だった）
+- 検証：ホスト版でテスト 37 件全通過（従来 10 件＋`set!`／カウンタ・クロージャ／末尾再帰カウンタ等）。実機書き込み（PROG31）はこれから
 
 ## ビルドと書き込み（概要）
 

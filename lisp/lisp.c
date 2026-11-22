@@ -1,4 +1,7 @@
-// TangLisp v1 -- a tiny Lisp for the PicoRV32 SoC on Tang Primer 25K.
+// TangLisp v2 -- a tiny Lisp for the PicoRV32 SoC on Tang Primer 25K.
+// v2 adds set! and proper tail calls: eval is a trampoline loop, so a
+// call in tail position (if branches, last body form, let/begin tail)
+// reuses the same C frame instead of growing the stack.
 // No libc, no division/modulo operators (RV32I has no div; libgcc avoided).
 #define UART_DATA (*(volatile unsigned int *)0x02000000u)
 #define UART_STAT (*(volatile unsigned int *)0x02000004u)
@@ -174,7 +177,7 @@ struct Sym { char name[16]; };
 static struct Sym symtab[NSYMS] __attribute__((aligned(8)));
 static int nsyms = 0;
 static val sym_t, sym_quote, sym_if, sym_lambda, sym_define, sym_let,
-           sym_begin, sym_closure;
+           sym_begin, sym_closure, sym_set;
 
 static int streq(const char *a, const char *b)
 {
@@ -455,18 +458,13 @@ static val make_closure(val params, val body, val env)
     return r;
 }
 
-static val apply(val f, val args)
+// Bind params to args on top of the closure env. Returns the new env
+// (NIL on error, with lisp_err set). f and args stay rooted by caller.
+static val bind_params(val f, val args)
 {
-    val params, body, newenv, p, a;
+    val params, newenv, p, a;
     int nslot;
-    if (lisp_err) return NIL;
-    if (is_prim(f)) return apply_prim(f >> 3, args);
-    if (!is_cons(f) || car(f) != sym_closure) {
-        error_("not a function");
-        return NIL;
-    }
     params = car(cdr(f));
-    body = car(cdr(cdr(f)));
     newenv = car(cdr(cdr(cdr(f))));
     nslot = nroots;
     push_root(newenv);
@@ -485,117 +483,208 @@ static val apply(val f, val args)
     }
     if (!lisp_err && (p != NIL || a != NIL)) error_("arity mismatch");
     nroots = nslot;
-    if (lisp_err) return NIL;
-    return eval_seq(body, newenv);
+    return lisp_err ? NIL : newenv;
 }
 
-static val eval_inner(val e, val env)
+static val apply(val f, val args)
 {
-    val head;
+    val newenv;
     if (lisp_err) return NIL;
-    if (e == NIL || is_int(e) || is_prim(e)) return e;
-    if (is_sym(e)) return lookup(e, env);
-    if (!is_cons(e)) return e;
-    head = car(e);
-    if (head == sym_quote) return car(cdr(e));
-    if (head == sym_if) {
-        val cond = eval(car(cdr(e)), env);
-        if (lisp_err) return NIL;
-        if (cond != NIL) return eval(car(cdr(cdr(e))), env);
-        if (is_cons(cdr(cdr(cdr(e))))) return eval(car(cdr(cdr(cdr(e)))), env);
+    if (is_prim(f)) return apply_prim(f >> 3, args);
+    if (!is_cons(f) || car(f) != sym_closure) {
+        error_("not a function");
         return NIL;
     }
-    if (head == sym_lambda)
-        return make_closure(car(cdr(e)), cdr(cdr(e)), env);
-    if (head == sym_define) {
-        val target = car(cdr(e));
-        if (is_cons(target)) {
-            // (define (name . params) body...) -- bind first so the
-            // closure's env includes its own binding (recursion).
-            val bind = cons(car(target), NIL);
-            val clo;
-            int bslot;
-            if (lisp_err) return NIL;
-            bslot = nroots;
-            push_root(bind);
-            genv = cons(bind, genv);
-            clo = lisp_err ? NIL
-                           : make_closure(cdr(target), cdr(cdr(e)), genv);
-            if (!lisp_err) ((struct Cell *)bind)->cdr = clo;
-            nroots = bslot;
-            return lisp_err ? NIL : clo;
-        }
-        {
-            val bind = cons(target, NIL);
-            val v;
-            int bslot;
-            if (lisp_err) return NIL;
-            bslot = nroots;
-            push_root(bind);
-            genv = cons(bind, genv);
-            v = lisp_err ? NIL : eval(car(cdr(cdr(e))), genv);
-            if (!lisp_err) ((struct Cell *)bind)->cdr = v;
-            nroots = bslot;
-            return lisp_err ? NIL : v;
-        }
-    }
-    if (head == sym_let) {
-        val binds = car(cdr(e));
-        val newenv = env;
-        int nslot = nroots;
-        val r = NIL;
-        push_root(newenv);
-        while (is_cons(binds) && !lisp_err) {
-            val b = car(binds);
-            val v = eval(car(cdr(b)), env);
-            val bind;
-            if (lisp_err) break;
-            push_root(v);
-            bind = cons(car(b), v);
-            nroots--;
-            if (lisp_err) break;
-            push_root(bind);
-            newenv = cons(bind, newenv);
-            roots[nslot] = newenv;
-            nroots--;
-            binds = cdr(binds);
-        }
-        if (!lisp_err) r = eval_seq(cdr(cdr(e)), newenv);
-        nroots = nslot;
-        return r;
-    }
-    if (head == sym_begin) return eval_seq(cdr(e), env);
-    {
-        val f = eval(head, env);
-        val args;
-        int fslot;
-        if (lisp_err) return NIL;
-        fslot = nroots;
-        push_root(f);
-        args = eval_list(cdr(e), env);
-        if (!lisp_err) {
-            val r;
-            push_root(args);
-            r = apply(f, args);
-            nroots = fslot;
-            return r;
-        }
-        nroots = fslot;
-        return NIL;
-    }
+    newenv = bind_params(f, args);
+    if (lisp_err) return NIL;
+    return eval_seq(car(cdr(cdr(f))), newenv);
 }
 
-// eval() roots the expression and the environment for the whole
-// evaluation, so a gc triggered by any cons below can mark them.
+// Helper for the trampoline: evaluate every form in body except the
+// last one (in env), return the last form. NIL body -> NIL flag via
+// *empty. body is part of an already-rooted structure, so walking it
+// across eval() calls (which may gc) is safe.
+static val seq_last(val body, val env, int *empty)
+{
+    *empty = 0;
+    if (!is_cons(body)) { *empty = 1; return NIL; }
+    while (is_cons(cdr(body)) && !lisp_err) {
+        eval(car(body), env);
+        body = cdr(body);
+    }
+    if (lisp_err) return NIL;
+    return car(body);
+}
+
+// eval() is a trampoline: tail positions never recurse in C.
+// The loop state is (e, env); roots[base] / roots[base+1] always hold
+// the current pair, so a gc triggered by any cons can mark them, and
+// they are refreshed at the top of every iteration.
+// Tail positions handled by looping: if branches, the last form of a
+// begin / let body / closure body, and a closure call in tail position
+// (bind params, then loop over its body). Everything else (operator,
+// operands, if condition, let init forms, set! value, non-last body
+// forms) goes through a nested eval() call, whose own trampoline keeps
+// its depth at one frame per non-tail nesting level.
 static val eval(val e, val env)
 {
     int base = nroots;
-    val r;
     push_root(e);
     push_root(env);
-    r = eval_inner(e, env);
-    nroots = base;
-    return r;
+    for (;;) {
+        val head;
+        roots[base] = e;
+        roots[base + 1] = env;
+        if (lisp_err) break;
+        if (e == NIL || is_int(e) || is_prim(e)) break;
+        if (is_sym(e)) { e = lookup(e, env); break; }
+        if (!is_cons(e)) break;
+        head = car(e);
+        if (head == sym_quote) { e = car(cdr(e)); break; }
+        if (head == sym_if) {
+            val cond = eval(car(cdr(e)), env);
+            if (lisp_err) break;
+            if (cond != NIL) e = car(cdr(cdr(e)));
+            else if (is_cons(cdr(cdr(cdr(e))))) e = car(cdr(cdr(cdr(e))));
+            else { e = NIL; break; }
+            continue;
+        }
+        if (head == sym_lambda) {
+            e = make_closure(car(cdr(e)), cdr(cdr(e)), env);
+            break;
+        }
+        if (head == sym_define) {
+            val target = car(cdr(e));
+            if (is_cons(target)) {
+                // (define (name . params) body...) -- bind first so the
+                // closure's env includes its own binding (recursion).
+                val bind = cons(car(target), NIL);
+                val clo;
+                int bslot;
+                if (lisp_err) break;
+                bslot = nroots;
+                push_root(bind);
+                genv = cons(bind, genv);
+                clo = lisp_err ? NIL
+                               : make_closure(cdr(target), cdr(cdr(e)), genv);
+                if (!lisp_err) ((struct Cell *)bind)->cdr = clo;
+                nroots = bslot;
+                e = lisp_err ? NIL : clo;
+                break;
+            }
+            {
+                val bind = cons(target, NIL);
+                val v;
+                int bslot;
+                if (lisp_err) break;
+                bslot = nroots;
+                push_root(bind);
+                genv = cons(bind, genv);
+                v = lisp_err ? NIL : eval(car(cdr(cdr(e))), genv);
+                if (!lisp_err) ((struct Cell *)bind)->cdr = v;
+                nroots = bslot;
+                e = lisp_err ? NIL : v;
+                break;
+            }
+        }
+        if (head == sym_set) {
+            // (set! name value) -- value is not a tail position.
+            val target = car(cdr(e));
+            val v;
+            if (!is_sym(target) || !is_cons(cdr(cdr(e)))) {
+                error_("bad set!");
+                break;
+            }
+            v = eval(car(cdr(cdr(e))), env);
+            if (lisp_err) break;
+            set_var(target, v, env);
+            e = v;
+            break;
+        }
+        if (head == sym_let) {
+            val binds = car(cdr(e));
+            val newenv = env;
+            int nslot = nroots;
+            int empty = 0;
+            val last;
+            push_root(newenv);
+            while (is_cons(binds) && !lisp_err) {
+                val b = car(binds);
+                val v = eval(car(cdr(b)), env);
+                val bind;
+                if (lisp_err) break;
+                push_root(v);
+                bind = cons(car(b), v);
+                nroots--;
+                if (lisp_err) break;
+                push_root(bind);
+                newenv = cons(bind, newenv);
+                roots[nslot] = newenv;
+                nroots--;
+                binds = cdr(binds);
+            }
+            if (lisp_err) { nroots = nslot; break; }
+            last = seq_last(cdr(cdr(e)), newenv, &empty);
+            nroots = nslot;
+            if (lisp_err) break;
+            if (empty) { e = NIL; break; }
+            e = last;
+            env = newenv;
+            continue;
+        }
+        if (head == sym_begin) {
+            int empty = 0;
+            val last = seq_last(cdr(e), env, &empty);
+            if (lisp_err) break;
+            if (empty) { e = NIL; break; }
+            e = last;
+            continue;
+        }
+        {
+            // Function call. Operator and operands are not tail
+            // positions; the call itself is, if this eval is.
+            val f = eval(head, env);
+            val args;
+            int fslot;
+            if (lisp_err) break;
+            fslot = nroots;
+            push_root(f);
+            args = eval_list(cdr(e), env);
+            if (lisp_err) { nroots = fslot; break; }
+            push_root(args);
+            if (is_prim(f)) {
+                e = apply_prim(f >> 3, args);
+                nroots = fslot;
+                break;
+            }
+            if (!is_cons(f) || car(f) != sym_closure) {
+                error_("not a function");
+                nroots = fslot;
+                break;
+            }
+            {
+                val newenv = bind_params(f, args);
+                int empty = 0;
+                val last;
+                if (lisp_err) { nroots = fslot; break; }
+                push_root(newenv);
+                last = seq_last(car(cdr(cdr(f))), newenv, &empty);
+                if (lisp_err) { nroots = fslot; break; }
+                if (empty) { nroots = fslot; e = NIL; break; }
+                // Tail call: reuse this frame. f/args/newenv roots are
+                // dropped; the loop roots take over with (last, newenv).
+                nroots = base + 2;
+                e = last;
+                env = newenv;
+                continue;
+            }
+        }
+    }
+    {
+        val r = lisp_err ? NIL : e;
+        nroots = base;
+        return r;
+    }
 }
 
 // ---------- REPL ----------
@@ -642,7 +731,7 @@ int main(void)
     static char expr[640];
     int i;
 
-    puts_("\nTangLisp v1 -- a tiny Lisp on PicoRV32 / Tang Primer 25K\n");
+    puts_("\nTangLisp v2 -- a tiny Lisp on PicoRV32 / Tang Primer 25K\n");
     gc_init();
     sym_t = intern("t");
     sym_quote = intern("quote");
@@ -651,6 +740,7 @@ int main(void)
     sym_define = intern("define");
     sym_let = intern("let");
     sym_begin = intern("begin");
+    sym_set = intern("set!");
     sym_closure = intern("*closure*");
     genv = cons(cons(sym_t, sym_t), NIL);
     for (i = 0; prim_names[i]; i++) {
