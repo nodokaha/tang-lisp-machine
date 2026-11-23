@@ -10,13 +10,13 @@ set(PICO_STACK_SIZE 0x8000)
 
 pico_sdk_init()
 
-add_executable(tanglisp_rp2040 lisp_rp2040.c)
+add_executable(tanglisp_rp2040 lisp_rp2040.c display_macropad.c)
 
 # The interpreter ships its own memset/memcpy; keep the compiler from
 # turning their loops into calls to themselves (the old RISC-V lesson).
 target_compile_options(tanglisp_rp2040 PRIVATE -fno-builtin)
 
-target_link_libraries(tanglisp_rp2040 pico_stdlib)
+target_link_libraries(tanglisp_rp2040 pico_stdlib hardware_spi)
 
 pico_enable_stdio_usb(tanglisp_rp2040 1)
 pico_enable_stdio_uart(tanglisp_rp2040 0)

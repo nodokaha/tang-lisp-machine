@@ -66,6 +66,22 @@ def parse_capacity(data):
     return last_lba, block_size
 
 
+def parse_mbr_partition_lba(sector):
+    """First partition's start LBA if sector 0 is an MBR, else 0.
+
+    The RP2040 bootrom volume is partitioned: LBA0 is an MBR (no BPB,
+    just a partition table and the 55AA signature), the FAT volume
+    boot record lives at the partition start (LBA1 on the RP2).
+    """
+    if len(sector) < 512 or sector[510:512] != b"\x55\xaa":
+        return 0
+    ptype = sector[450]
+    start = struct.unpack_from("<I", sector, 454)[0]
+    if ptype == 0 or start == 0:
+        return 0
+    return start
+
+
 def parse_bpb_data_start(sector):
     """First data-area LBA of a FAT12/16/32 volume from its boot sector."""
     if len(sector) < 512:

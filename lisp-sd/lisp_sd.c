@@ -98,9 +98,9 @@ static void putnum(int n)
 // The low-level part between SDLOW_BEGIN/SDLOW_END is the only piece
 // that touches the SPI hardware; the host test build swaps it for a
 // disk-image-backed version. Everything FAT uses just sd_init(),
-// sd_read_block() and sd_write_block(). Writing is limited to
-// overwriting the blocks of a pre-allocated HEAPIMG.BIN (Stage 3c);
-// no FAT allocation or directory creation is implemented.
+// sd_read_block() and sd_write_block(). Stage 3c wrote by
+// overwriting a pre-allocated HEAPIMG.BIN; Stage 3d adds FAT cluster
+// allocation and directory creation (see fat_create below).
 static void puthex8(unsigned v)
 {
     static const char hexd[] = "0123456789ABCDEF";
@@ -149,6 +149,8 @@ static void lisp_poke(unsigned addr, unsigned v) { *(volatile unsigned *)addr = 
 static void lisp_spi_cs(int a) { sd_cs(a); }
 static void lisp_spi_fast(int f) { spi_set_fast(f); }
 static int lisp_spi_byte(int b) { return (int)spi_xfer((unsigned char)b); }
+static int lisp_keybits(void) { return 0; }  // no keypad on this board
+static int lisp_encpos(void) { return 0; }   // no encoder on this board
 static unsigned char sd_send_cmd(unsigned idx, unsigned arg, unsigned crc)
 {
     unsigned char r = 0xFF;
@@ -281,10 +283,11 @@ static int sd_write_block(unsigned lba, const unsigned char *buf)
 }
 /*SDLOW_END*/
 
-// ---------- FAT32 (read-only) ----------
+// ---------- FAT32 (read + Stage 3d file creation) ----------
 static unsigned char blk[512];
 static unsigned fat_part_lba, fat_begin, fat_data_begin;
 static unsigned fat_spc, fat_root_cluster;
+static unsigned fat_nfats, fat_fatsz, fat_nclusters, fat_clog;
 static unsigned auto_cluster, auto_size;
 static unsigned heap_cluster, heap_size;
 #define AUTOBUF_SIZE 1280
@@ -354,6 +357,16 @@ static int fat_mount(void)
     }
     fat_begin = fat_part_lba + reserved;
     fat_data_begin = fat_begin + nfats * fatsz;
+    fat_nfats = nfats;
+    fat_fatsz = fatsz;
+    {
+        unsigned totsec = rd32(blk + 32);
+        unsigned lg = 0;
+        if (totsec == 0) totsec = rd16(blk + 19);
+        while ((1u << lg) < fat_spc) lg++;
+        fat_clog = 9 + lg; // log2 of bytes per cluster
+        fat_nclusters = ((totsec - (reserved + nfats * fatsz)) >> lg) + 2;
+    }
     puts_("FAT32: spc="); putnum((int)fat_spc);
     puts_(" fat_begin="); putnum((int)fat_begin);
     puts_(" data_begin="); putnum((int)fat_data_begin);
@@ -477,6 +490,140 @@ static unsigned fat_find(const char *name83, unsigned *size_out)
     return 0;
 }
 
+// ---------- Stage 3d: FAT write support (create / replace files) ----------
+// Until now (save) could only overwrite a pre-allocated HEAPIMG.BIN.
+// These helpers allocate fresh cluster chains, free old ones, and
+// write directory entries, so the firmware can create files itself.
+// All of them use blk[] as scratch, one block at a time.
+static void wr32(unsigned char *p, unsigned v); // defined with the heap image code
+
+// Write one FAT entry in every FAT copy (top nibble preserved).
+static int fat_set(unsigned c, unsigned v)
+{
+    unsigned sec = (c * 4u) >> 9;
+    unsigned sofs = (c * 4u) & 511u;
+    unsigned f;
+    for (f = 0; f < fat_nfats; f++) {
+        unsigned lba = fat_begin + f * fat_fatsz + sec;
+        unsigned cur;
+        if (sd_read_block(lba, blk) != 0) return -1;
+        cur = rd32(blk + sofs);
+        wr32(blk + sofs, (cur & 0xF0000000u) | (v & 0x0FFFFFFFu));
+        if (sd_write_block(lba, blk) != 0) return -1;
+    }
+    return 0;
+}
+
+static void fat_free_chain(unsigned first)
+{
+    unsigned c = first;
+    int guard = 0;
+    while (c >= 2 && c < 0x0FFFFFF8u && guard++ < 100000) {
+        unsigned nx = fat_next(c);
+        fat_set(c, 0);
+        c = nx;
+    }
+}
+
+// Allocate a chain of n clusters (linked, EOC-terminated).
+// Returns the first cluster, or 0 (nothing allocated) on failure.
+static unsigned fat_alloc_chain(unsigned n)
+{
+    unsigned first = 0, prev = 0, c = 2, got = 0;
+    while (got < n && c < fat_nclusters) {
+        if (fat_next(c) == 0) {
+            if (fat_set(c, 0x0FFFFFFFu) != 0) goto fail;
+            if (prev) { if (fat_set(prev, c) != 0) goto fail; }
+            else first = c;
+            prev = c;
+            got++;
+        }
+        c++;
+    }
+    if (got < n) goto fail;
+    return first;
+fail:
+    fat_free_chain(first);
+    return 0;
+}
+
+// One pass over the root directory: locate the entry for name83
+// (slot LBA/offset, cluster, size) and the first free slot.
+struct DirHit {
+    int found; unsigned cluster; unsigned size; unsigned lba; int off;
+    int has_free; unsigned free_lba; int free_off;
+};
+static void fat_scan_create(const char *name83, struct DirHit *h)
+{
+    unsigned c = fat_root_cluster;
+    int guard = 0;
+    h->found = 0; h->has_free = 0;
+    h->cluster = 0; h->size = 0; h->lba = 0; h->off = 0;
+    h->free_lba = 0; h->free_off = 0;
+    while (c >= 2 && c < 0x0FFFFFF8u && guard++ < 10000) {
+        unsigned s;
+        for (s = 0; s < fat_spc; s++) {
+            int off;
+            if (sd_read_block(cluster_lba(c) + s, blk) != 0) return;
+            for (off = 0; off < 512; off += 32) {
+                const unsigned char *e = blk + off;
+                int i, match;
+                if (e[0] == 0x00 || e[0] == 0xE5) {
+                    if (!h->has_free) {
+                        h->has_free = 1;
+                        h->free_lba = cluster_lba(c) + s;
+                        h->free_off = off;
+                    }
+                    if (e[0] == 0x00) return; // end of directory
+                    continue;
+                }
+                if (e[11] == 0x0F) continue;
+                if (e[11] & 0x18) continue;
+                match = 1;
+                for (i = 0; i < 11; i++)
+                    if (e[i] != (unsigned char)name83[i]) match = 0;
+                if (match) {
+                    h->found = 1;
+                    h->cluster = (rd16(e + 20) << 16) | rd16(e + 26);
+                    h->size = rd32(e + 28);
+                    h->lba = cluster_lba(c) + s;
+                    h->off = off;
+                    return;
+                }
+            }
+        }
+        c = fat_next(c);
+    }
+}
+
+// Create a root file with the given 8.3 name and size, replacing any
+// existing file of the same name. Returns the first cluster or 0.
+static unsigned fat_create(const char *name83, unsigned size)
+{
+    struct DirHit h;
+    unsigned ncl, first, lba;
+    int off, i;
+    fat_scan_create(name83, &h);
+    ncl = (size + ((1u << fat_clog) - 1u)) >> fat_clog;
+    if (ncl == 0) ncl = 1;
+    first = fat_alloc_chain(ncl);
+    if (!first) { puts_("fat: no free clusters\n"); return 0; }
+    if (h.found) { fat_free_chain(h.cluster); lba = h.lba; off = h.off; }
+    else if (h.has_free) { lba = h.free_lba; off = h.free_off; }
+    else { fat_free_chain(first); puts_("fat: root directory full\n"); return 0; }
+    if (sd_read_block(lba, blk) != 0) { fat_free_chain(first); return 0; }
+    for (i = 0; i < 32; i++) blk[off + i] = 0;
+    for (i = 0; i < 11; i++) blk[off + i] = (unsigned char)name83[i];
+    blk[off + 11] = 0x20; // archive
+    blk[off + 20] = (unsigned char)(first >> 16);
+    blk[off + 21] = (unsigned char)(first >> 24);
+    blk[off + 26] = (unsigned char)first;
+    blk[off + 27] = (unsigned char)(first >> 8);
+    wr32(blk + off + 28, size);
+    if (sd_write_block(lba, blk) != 0) { fat_free_chain(first); return 0; }
+    return first;
+}
+
 // Sequential block walker over a file's cluster chain (Stage 3c).
 // img_walk_next() returns the LBA of the current block and advances.
 // Note it may call fat_next(), which reuses blk[] as scratch -- so
@@ -514,8 +661,10 @@ static val mk_int(int n)  { return (n << 1) | 1; }
 static int int_val(val v) { return v >> 1; }
 
 struct Cell { val car, cdr; };
-#define NCELLS 950
-static struct Cell cells[NCELLS];
+// NCELLS was 950 until Stage 3d; trimmed to fit the FAT write code
+// in the 32K RAM budget (named worlds on SD make up the difference).
+#define NCELLS 700
+static struct Cell cells[NCELLS] __attribute__((aligned(8))); // tagged pointers require 8-alignment
 static val car(val v) { return ((struct Cell *)v)->car; }
 static val cdr(val v) { return ((struct Cell *)v)->cdr; }
 
@@ -531,7 +680,7 @@ static void error_(const char *msg)
 // eval/apply/parse push every value that is alive only in a C local,
 // so cons() may run gc() when the heap runs dry, even mid-eval. ----
 #define NWORDS ((NCELLS + 31) / 32)
-#define NROOTS 512
+#define NROOTS 256 // 512 until Stage 3d; trimmed for the 32K RAM budget
 static val roots[NROOTS];
 static int nroots = 0;
 static void push_root(val v) { if (nroots < NROOTS) roots[nroots++] = v; }
@@ -598,7 +747,7 @@ struct Sym { char name[16]; };
 static struct Sym symtab[NSYMS] __attribute__((aligned(8)));
 static int nsyms = 0;
 static val sym_t, sym_quote, sym_if, sym_lambda, sym_define, sym_let,
-           sym_begin, sym_closure, sym_set, sym_load;
+           sym_begin, sym_closure, sym_set, sym_load, sym_save, sym_restore;
 
 static int streq(const char *a, const char *b)
 {
@@ -840,9 +989,15 @@ static val eval_list(val exprs, val env)
 #define PRIM_ASH 27
 #define PRIM_LOGAND 28
 #define PRIM_LOGIOR 29
+#define PRIM_KEYS 30
+#define PRIM_ENC 31
+#define PRIM_RESTORE 32
 static val prim_load(const char *name);
 
 static int heap_save(void); // defined below, with the SD boot stage
+static int heap_restore(void); // likewise
+static int world_save(const char *name);   // (save NAME.BIN), Stage 3d
+static int world_restore(const char *name); // (restore NAME.BIN), Stage 3d
 
 static val apply_prim(int idx, val args)
 {
@@ -908,7 +1063,15 @@ static val apply_prim(int idx, val args)
         putc_('\n');
         return a;
     case PRIM_SAVE:
-        return heap_save() == 0 ? sym_t : NIL;
+        a = is_cons(args) ? car(args) : NIL;
+        if (a == NIL) return heap_save() == 0 ? sym_t : NIL;
+        if (!is_sym(a)) { error_("save: need a file name symbol"); return NIL; }
+        return world_save(sym_name(a)) == 0 ? sym_t : NIL;
+    case PRIM_RESTORE:
+        a = is_cons(args) ? car(args) : NIL;
+        if (a == NIL) return heap_restore() == 0 ? sym_t : NIL;
+        if (!is_sym(a)) { error_("restore: need a file name symbol"); return NIL; }
+        return world_restore(sym_name(a)) == 0 ? sym_t : NIL;
     case PRIM_LOAD:
         a = is_cons(args) ? car(args) : NIL;
         if (!is_sym(a)) { error_("load: need a file name symbol"); return NIL; }
@@ -980,6 +1143,10 @@ static val apply_prim(int idx, val args)
     case PRIM_LOGIOR:
         if (!is_cons(args) || !is_cons(cdr(args))) { error_("bad args"); return NIL; }
         return mk_int(int_val(car(args)) | int_val(car(cdr(args))));
+    case PRIM_KEYS:
+        return mk_int(lisp_keybits());
+    case PRIM_ENC:
+        return mk_int(lisp_encpos());
     }
     error_("bad primitive");
     return NIL;
@@ -1157,6 +1324,28 @@ static val eval(val e, val env)
             e = prim_load(sym_name(target));
             break;
         }
+        if (head == sym_save) {
+            // (save) writes HEAPIMG.BIN; (save NAME.BIN) creates a
+            // named world file. NAME is a literal symbol, not
+            // evaluated (same convention as load).
+            val target = is_cons(cdr(e)) ? car(cdr(e)) : NIL;
+            if (target == NIL) { e = heap_save() == 0 ? sym_t : NIL; break; }
+            if (!is_sym(target)) { error_("save: need a file name"); break; }
+            e = world_save(sym_name(target)) == 0 ? sym_t : NIL;
+            break;
+        }
+        if (head == sym_restore) {
+            // (restore) reads HEAPIMG.BIN; (restore NAME.BIN) switches
+            // to a named world. The restored world's sym_t is what the
+            // form returns, so read it only after the switch.
+            val target = is_cons(cdr(e)) ? car(cdr(e)) : NIL;
+            int ok;
+            if (target == NIL) ok = heap_restore() == 0;
+            else if (!is_sym(target)) { error_("restore: need a file name"); break; }
+            else ok = world_restore(sym_name(target)) == 0;
+            e = ok ? sym_t : NIL;
+            break;
+        }
         if (head == sym_let) {
             val binds = car(cdr(e));
             val newenv = env;
@@ -1251,14 +1440,14 @@ static val eval(val e, val env)
 //   block 1..   payload: raw bytes of cells[], symtab[], usedbits[]
 //               concatenated and zero-padded to a block boundary.
 // Cells and symbols contain raw pointers, so an image is only valid
-// for the exact same firmware binary and memory layout. The file
-// must already exist on the card with at least IMG_FILE_BYTES bytes
-// allocated; (save) only overwrites its existing cluster chain.
+// for the exact same firmware binary and memory layout. (save) with
+// no argument overwrites the pre-allocated HEAPIMG.BIN; (save NAME)
+// creates or replaces a named file via fat_create (Stage 3d).
 #define IMG_PAYLOAD_BYTES ((unsigned)sizeof(cells) + (unsigned)sizeof(symtab) + \
                            (unsigned)sizeof(usedbits))
 #define IMG_TOTAL_BLOCKS (1u + ((IMG_PAYLOAD_BYTES + 511u) >> 9))
 #define IMG_FILE_BYTES (IMG_TOTAL_BLOCKS << 9)
-#define IMG_VERSION 3u // bumped on every layout change (2: (load) build, 3: SPI prims build)
+#define IMG_VERSION 4u // bumped on every layout change (2: (load), 3: SPI prims, 4: NCELLS 800 / worlds)
 
 static void wr32(unsigned char *p, unsigned v)
 {
@@ -1302,13 +1491,11 @@ static int heap_file_ok(void)
     return 1;
 }
 
-static int heap_save(void)
+static int heap_save_to(unsigned cluster)
 {
     struct ImgWalk w;
     unsigned cksum = 0, used = 0, produced;
     unsigned b, i;
-    if (!heap_cluster) { puts_("save: HEAPIMG.BIN not found\n"); return -1; }
-    if (!heap_file_ok()) { puts_("save: HEAPIMG.BIN too small\n"); return -1; }
     img_cursor_init();
     for (b = 0; b < 3; b++)
         for (i = 0; i < img_reg_len[b]; i++)
@@ -1317,7 +1504,7 @@ static int heap_save(void)
         unsigned x = usedbits[i];
         while (x) { used += x & 1u; x >>= 1; }
     }
-    img_walk_init(&w, heap_cluster);
+    img_walk_init(&w, cluster);
     produced = 0;
     for (b = 0; b < IMG_TOTAL_BLOCKS; b++) {
         unsigned lba = img_walk_next(&w); // before touching blk[]
@@ -1342,21 +1529,28 @@ static int heap_save(void)
             return -1;
         }
     }
-    puts_("save: heap image written to HEAPIMG.BIN\n");
+    puts_("save: heap image written\n");
     return 0;
+}
+
+static int heap_save(void)
+{
+    if (!heap_cluster) { puts_("save: HEAPIMG.BIN not found\n"); return -1; }
+    if (!heap_file_ok()) { puts_("save: HEAPIMG.BIN too small\n"); return -1; }
+    return heap_save_to(heap_cluster);
 }
 
 // 0 = image restored (cells/symtab/usedbits/nsyms/genv overwritten,
 // freelist rebuilt by one gc). -1 = no valid image; caller falls
 // back to the AUTOEXEC path and nothing has been modified.
-static int heap_restore(void)
+static int heap_restore_from(unsigned cluster, unsigned size)
 {
     struct ImgWalk w;
     unsigned saved_nsyms, saved_genv, saved_cksum, payload;
     unsigned cksum, remaining, consumed;
     unsigned b, i, lba;
-    if (!heap_file_ok()) return -1;
-    img_walk_init(&w, heap_cluster);
+    if (((size + 511u) >> 9) < IMG_TOTAL_BLOCKS) return -1;
+    img_walk_init(&w, cluster);
     lba = img_walk_next(&w);
     if (sd_read_block(lba, blk) != 0) return -1;
     if (blk[0] != 'T' || blk[1] != 'L' || blk[2] != 'H' || blk[3] != 'P')
@@ -1383,7 +1577,7 @@ static int heap_restore(void)
     }
     // Pass 2: copy the payload into place.
     img_cursor_init();
-    img_walk_init(&w, heap_cluster);
+    img_walk_init(&w, cluster);
     img_walk_next(&w); // skip header
     consumed = 0;
     for (b = 1; b < IMG_TOTAL_BLOCKS; b++) {
@@ -1395,6 +1589,71 @@ static int heap_restore(void)
     nsyms = (int)saved_nsyms;
     genv = (val)saved_genv;
     gc(); // rebuild freelist from restored usedbits + reachability
+    return 0;
+}
+
+static int heap_restore(void)
+{
+    if (!heap_file_ok()) return -1;
+    return heap_restore_from(heap_cluster, heap_size);
+}
+
+// ---------- Stage 3d: named heap worlds ----------
+// (save W1.BIN) creates (or replaces) a file on the card and writes
+// the heap image into it; (restore W1.BIN) reads it back, replacing
+// the whole live world. Any number of worlds can live on the card.
+// Note: restore replaces genv/symtab/cells wholesale, so it is meant
+// as a top-level REPL command -- the value of the (restore ...) form
+// itself is the only thing carried across the switch.
+static int world_name83(const char *name, char *n83)
+{
+    int i, dot = -1, ni = 0;
+    for (i = 0; i < 11; i++) n83[i] = ' ';
+    n83[11] = 0;
+    for (i = 0; name[i]; i++) {
+        char c = name[i];
+        if (c >= 'a' && c <= 'z') c = (char)(c - 'a' + 'A');
+        if (c == '.') {
+            if (dot >= 0) return -1;
+            dot = i;
+            continue;
+        }
+        if (dot < 0) {
+            if (ni >= 8) return -1;
+            n83[ni++] = c;
+        } else {
+            int ei = i - dot - 1;
+            if (ei >= 3) return -1;
+            n83[8 + ei] = c;
+        }
+    }
+    return ni == 0 ? -1 : 0;
+}
+
+static int world_save(const char *name)
+{
+    char n83[12];
+    unsigned cluster;
+    if (!sd_mounted) { puts_("save: SD unavailable\n"); return -1; }
+    if (world_name83(name, n83) != 0) { puts_("save: bad name\n"); return -1; }
+    cluster = fat_create(n83, IMG_FILE_BYTES);
+    if (!cluster) { puts_("save: cannot create file\n"); return -1; }
+    return heap_save_to(cluster);
+}
+
+static int world_restore(const char *name)
+{
+    char n83[12];
+    unsigned cluster, size;
+    if (!sd_mounted) { puts_("restore: SD unavailable\n"); return -1; }
+    if (world_name83(name, n83) != 0) { puts_("restore: bad name\n"); return -1; }
+    cluster = fat_find(n83, &size);
+    if (!cluster) { puts_("restore: file not found\n"); return -1; }
+    if (heap_restore_from(cluster, size) != 0) {
+        puts_("restore: not a valid heap image\n");
+        return -1;
+    }
+    puts_("restore: world restored\n");
     return 0;
 }
 
@@ -1538,13 +1797,13 @@ static const char *prim_names[] = {
     "null?", "pair?", "eq?", "not", "list", "print", "save", "load",
     "make-bytes", "bytes-ref", "bytes-set!", "bytes-length", "bytes?",
     "peek", "poke", "spi-cs", "spi-fast", "spi-byte", "ash",
-    "logand", "logior", 0
+    "logand", "logior", "keys", "enc", "restore", 0
 };
 
 int main(void)
 {
     static char line[256];
-    static char expr[640];
+    static char expr[384];
     int i;
 
     puts_("\nTangLisp v2+SD -- a tiny Lisp on PicoRV32 / Tang Primer 25K\n");
@@ -1558,6 +1817,8 @@ int main(void)
     sym_begin = intern("begin");
     sym_set = intern("set!");
     sym_load = intern("load");
+    sym_save = intern("save");
+    sym_restore = intern("restore");
     sym_closure = intern("*closure*");
     genv = cons(cons(sym_t, sym_t), NIL);
     for (i = 0; prim_names[i]; i++) {

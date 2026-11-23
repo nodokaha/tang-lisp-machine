@@ -135,6 +135,9 @@ syntax-rules とライブラリ。
 
 ## 入力パネル：MacroPad を命令入力機にする（2026-11-22夜、清涼の案）
 
+※ 2026-11-23、清涼の判断で MacroPad は寄り道として棚上げ
+（この案も保留）。経緯と再開材料は `rp2040/DETOUR.md` に記録。
+
 - 手持ちの Adafruit MacroPad RP2040 Starter Kit（12キー＋
   ロータリーエンコーダ＋128×64 OLED＋キーごとの NeoPixel＋
   スピーカー）を、SECD マシンのフロントパネルとして使う案

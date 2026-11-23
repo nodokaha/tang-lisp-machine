@@ -21,15 +21,17 @@ src = (HERE.parent / "lisp-sd" / "lisp_sd.c").read_text()
 src = src.replace(
     '#define UART_DATA (*(volatile unsigned int *)0x02000000u)\n'
     '#define UART_STAT (*(volatile unsigned int *)0x02000004u)',
-    '#include <stdio.h>\n#include <stdlib.h>\n'
+    '#include <stdio.h>\n#include <stdlib.h>\n#include "pico/stdio.h"\n'
     'static unsigned int uart_dummy_data, uart_dummy_stat;\n'
     '#define UART_DATA uart_dummy_data\n'
     '#define UART_STAT uart_dummy_stat')
 src = re.sub(r'static void putc_\(char c\)\n\{.*?\n\}',
-             'static void putc_(char c) { fputc(c, stdout); fflush(stdout); }',
+             'static void putc_(char c) { fputc(c, stdout); fflush(stdout); macropad_console_putc(c); }',
              src, flags=re.S)
 src = re.sub(r'static int getc_\(void\)\n\{.*?\n\}',
-             'static int getc_(void) { int c; do { c = getchar(); } while (c == EOF); return c; }',
+             'static int getc_(void) { for (;;) { int pc = macropad_getc_poll(); '
+             'if (pc >= 0) return pc; int c = getchar_timeout_us(10000); '
+             'if (c >= 0) return c; } }',
              src, flags=re.S)
 
 # --- SDLOW block -> RP2040 stubs ---
@@ -40,6 +42,8 @@ static void lisp_poke(unsigned addr, unsigned v) { *(volatile unsigned *)addr = 
 static void lisp_spi_cs(int a) { (void)a; }
 static void lisp_spi_fast(int f) { (void)f; }
 static int lisp_spi_byte(int b) { (void)b; return 0xFF; }
+static int lisp_keybits(void) { return macropad_keybits(); }
+static int lisp_encpos(void) { return macropad_encpos(); }
 static int sd_init(void) { return -1; }
 static int sd_read_block(unsigned lba, unsigned char *buf)
 { (void)lba; (void)buf; return -1; }
@@ -51,12 +55,27 @@ src, n = re.subn(r'/\*SDLOW_BEGIN\*/.*?/\*SDLOW_END\*/', stub.strip(),
 assert n == 1, "SDLOW block not found"
 
 # --- scale + banner ---
-src = src.replace('#define NCELLS 950', '#define NCELLS 16384')
+src = src.replace('#define NCELLS 800', '#define NCELLS 16384')
 src = src.replace('#define BYTES_ARENA_SIZE 528',
                   '#define BYTES_ARENA_SIZE 32768')
 src = src.replace(
     'TangLisp v2+SD -- a tiny Lisp on PicoRV32 / Tang Primer 25K',
-    'TangLisp v2 -- RP2040 port (MacroPad build, REPL only)')
+    'TangLisp RP2040')
+
+# --- OLED splash hook (display_macropad.c) ---
+src = src.replace(
+    'puts_("\\nTangLisp RP2040\\n");',
+    'stdio_init_all();\n'
+    '    macropad_keys_init();\n'
+    '    macropad_splash();\n'
+    '    puts_("\\nTangLisp RP2040\\n");')
+src = ('extern void macropad_splash(void);\n'
+       'extern void macropad_idle_tick(void);\n'
+       'extern void macropad_keys_init(void);\n'
+       'extern int macropad_keybits(void);\n'
+       'extern int macropad_encpos(void);\n'
+       'extern int macropad_getc_poll(void);\n'
+       'extern void macropad_console_putc(int c);\n') + src
 
 (HERE / "lisp_rp2040.c").write_text(src)
 print("wrote", HERE / "lisp_rp2040.c", len(src), "bytes")

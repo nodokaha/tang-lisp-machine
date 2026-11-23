@@ -1,3 +1,10 @@
+extern void macropad_splash(void);
+extern void macropad_idle_tick(void);
+extern void macropad_keys_init(void);
+extern int macropad_keybits(void);
+extern int macropad_encpos(void);
+extern int macropad_getc_poll(void);
+extern void macropad_console_putc(int c);
 // TangLisp v2+SD -- TangLisp v2 with an SD/FAT32 boot stage.
 // At boot, after the environment is built, the firmware mounts a FAT32
 // card over the SoC SPI master, lists the root directory, restores the
@@ -18,6 +25,7 @@
 // No libc, no division/modulo operators (RV32I has no div; libgcc avoided).
 #include <stdio.h>
 #include <stdlib.h>
+#include "pico/stdio.h"
 static unsigned int uart_dummy_data, uart_dummy_stat;
 #define UART_DATA uart_dummy_data
 #define UART_STAT uart_dummy_stat
@@ -57,9 +65,9 @@ int __mulsi3(int a, int b)
 }
 
 // ---------- UART ----------
-static void putc_(char c) { fputc(c, stdout); fflush(stdout); }
+static void putc_(char c) { fputc(c, stdout); fflush(stdout); macropad_console_putc(c); }
 static void puts_(const char *s) { while (*s) putc_(*s++); }
-static int getc_(void) { int c; do { c = getchar(); } while (c == EOF); return c; }
+static int getc_(void) { for (;;) { int pc = macropad_getc_poll(); if (pc >= 0) return pc; int c = getchar_timeout_us(10000); if (c >= 0) return c; } }
 
 // divide by 10 without the / operator (binary long division)
 static unsigned udiv10(unsigned n)
@@ -122,6 +130,8 @@ static void lisp_poke(unsigned addr, unsigned v) { *(volatile unsigned *)addr = 
 static void lisp_spi_cs(int a) { (void)a; }
 static void lisp_spi_fast(int f) { (void)f; }
 static int lisp_spi_byte(int b) { (void)b; return 0xFF; }
+static int lisp_keybits(void) { return macropad_keybits(); }
+static int lisp_encpos(void) { return macropad_encpos(); }
 static int sd_init(void) { return -1; }
 static int sd_read_block(unsigned lba, unsigned char *buf)
 { (void)lba; (void)buf; return -1; }
@@ -362,7 +372,7 @@ static int int_val(val v) { return v >> 1; }
 
 struct Cell { val car, cdr; };
 #define NCELLS 16384
-static struct Cell cells[NCELLS];
+static struct Cell cells[NCELLS] __attribute__((aligned(8))); // tagged pointers require 8-alignment
 static val car(val v) { return ((struct Cell *)v)->car; }
 static val cdr(val v) { return ((struct Cell *)v)->cdr; }
 
@@ -687,6 +697,8 @@ static val eval_list(val exprs, val env)
 #define PRIM_ASH 27
 #define PRIM_LOGAND 28
 #define PRIM_LOGIOR 29
+#define PRIM_KEYS 30
+#define PRIM_ENC 31
 static val prim_load(const char *name);
 
 static int heap_save(void); // defined below, with the SD boot stage
@@ -827,6 +839,10 @@ static val apply_prim(int idx, val args)
     case PRIM_LOGIOR:
         if (!is_cons(args) || !is_cons(cdr(args))) { error_("bad args"); return NIL; }
         return mk_int(int_val(car(args)) | int_val(car(cdr(args))));
+    case PRIM_KEYS:
+        return mk_int(lisp_keybits());
+    case PRIM_ENC:
+        return mk_int(lisp_encpos());
     }
     error_("bad primitive");
     return NIL;
@@ -1385,7 +1401,7 @@ static const char *prim_names[] = {
     "null?", "pair?", "eq?", "not", "list", "print", "save", "load",
     "make-bytes", "bytes-ref", "bytes-set!", "bytes-length", "bytes?",
     "peek", "poke", "spi-cs", "spi-fast", "spi-byte", "ash",
-    "logand", "logior", 0
+    "logand", "logior", "keys", "enc", 0
 };
 
 int main(void)
@@ -1394,7 +1410,10 @@ int main(void)
     static char expr[640];
     int i;
 
-    puts_("\nTangLisp v2 -- RP2040 port (MacroPad build, REPL only)\n");
+    stdio_init_all();
+    macropad_keys_init();
+    macropad_splash();
+    puts_("\nTangLisp RP2040\n");
     gc_init();
     sym_t = intern("t");
     sym_quote = intern("quote");

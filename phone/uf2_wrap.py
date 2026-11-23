@@ -74,7 +74,8 @@ libusb1._DeviceHandle.__init__ = _patched_handle_init
 import time
 sys.path.insert(0, os.path.expanduser("~"))
 from uf2_bot import (build_cbw, parse_csw, parse_capacity,
-                     parse_bpb_data_start, check_uf2, cdb_inquiry,
+                     parse_bpb_data_start, parse_mbr_partition_lba,
+                     check_uf2, cdb_inquiry,
                      cdb_test_unit_ready, cdb_request_sense,
                      cdb_read_capacity10, cdb_read10, cdb_write10,
                      RP2040_FAMILY)
@@ -108,7 +109,10 @@ if not devs:
 dev = devs[0]
 log("device: %04x:%04x" % (dev.idVendor, dev.idProduct))
 if (dev.idVendor, dev.idProduct) != (0x2E8A, 0x0003):
-    log("WARNING: not the usual RPI-RP2 ids (2e8a:0003); trying anyway")
+    # Safety gate (added after the 2026-11-22 CircuitPython incident):
+    # never write UF2 sectors into anything but the RP2040 bootrom device.
+    log("ABORT: not the RP2040 BOOTSEL device (2e8a:0003); refusing to write")
+    raise SystemExit(2)
 
 cfg = dev.get_active_configuration()
 ms_intf = None
@@ -180,7 +184,11 @@ if bsz != 512:
     raise SystemExit("unexpected block size %d" % bsz)
 
 st, din = bot(cdb_read10(0, 1), read_len=512)
-data_start = parse_bpb_data_start(din)
+part_lba = parse_mbr_partition_lba(din)
+if part_lba:
+    log("MBR found; partition starts at LBA", part_lba)
+    st, din = bot(cdb_read10(part_lba, 1), read_len=512)
+data_start = part_lba + parse_bpb_data_start(din)
 log("first data LBA:", data_start)
 
 CH = 8  # blocks per WRITE10 (4KB)

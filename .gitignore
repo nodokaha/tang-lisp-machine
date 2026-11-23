@@ -5,3 +5,5 @@
 *.log
 *.json
 __pycache__/
+rp2040/build/
+rp2040/hello_test/build/

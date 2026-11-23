@@ -143,6 +143,8 @@ static void lisp_spi_cs(int a)
 }
 static void lisp_spi_fast(int f) { (void)f; }
 static int lisp_spi_byte(int b) { return emu_cs ? emu_xfer(b) : 0xFF; }
+static int lisp_keybits(void) { return 0; }
+static int lisp_encpos(void) { return 0; }
 '''
 src = re.sub(r'/\*SDLOW_BEGIN\*/.*?/\*SDLOW_END\*/', '/*SDLOW_BEGIN*/' + host_low + '/*SDLOW_END*/', src, flags=re.S)
 
