@@ -66,6 +66,17 @@ static int getc_(void)
     return (int)(UART_DATA & 0xFFu);
 }
 
+// Launcher key wait: poll the UART for about 5 seconds (50 MHz,
+// roughly 8 cycles per poll). Returns the key byte, or -1 on timeout.
+static int boot_key_wait(int sec)
+{
+    long i, n = (long)sec * 6000000L;
+    for (i = 0; i < n; i++) {
+        if (UART_STAT & 1u) return (int)(UART_DATA & 0xFFu);
+    }
+    return -1;
+}
+
 // divide by 10 without the / operator (binary long division)
 static unsigned udiv10(unsigned n)
 {
@@ -290,6 +301,18 @@ static unsigned fat_spc, fat_root_cluster;
 static unsigned fat_nfats, fat_fatsz, fat_nclusters, fat_clog;
 static unsigned auto_cluster, auto_size;
 static unsigned heap_cluster, heap_size;
+static unsigned config_cluster, config_size, sys_cluster, sys_size;
+// Boot configuration, read from CONFIG.LSP at boot (F1).
+static int cfg_menu_sec = 5;
+static char cfg_default83[11];
+static int cfg_has_default;
+// Boot launcher candidates: root files ending in .BIN (a saved world)
+// or .LSP (an app), in root directory order. Chosen at boot by number.
+#define BOOT_MAX 8
+static char boot_name[BOOT_MAX][11];
+static unsigned boot_clu[BOOT_MAX];
+static unsigned boot_size[BOOT_MAX];
+static int boot_n;
 #define AUTOBUF_SIZE 1280
 static unsigned char autobuf[AUTOBUF_SIZE];
 static unsigned char loadbuf[AUTOBUF_SIZE];
@@ -391,6 +414,21 @@ static void print_dirent(const unsigned char *e)
     putnum((int)rd32(e + 28));
     puts_(" bytes\n");
 }
+
+// Print a stored 8.3 name ("W1      BIN") as "W1.BIN".
+static void print_83name(const char *n)
+{
+    int i, end;
+    end = 8;
+    while (end > 0 && n[end - 1] == ' ') end--;
+    for (i = 0; i < end; i++) putc_(n[i]);
+    if (n[8] != ' ') {
+        putc_('.');
+        end = 3;
+        while (end > 0 && n[8 + end - 1] == ' ') end--;
+        for (i = 0; i < end; i++) putc_(n[8 + i]);
+    }
+}
 // Lists the root directory; returns AUTOEXEC.LSP's first cluster
 // (0 = not found) and sets auto_size.
 static unsigned fat_scan_root(void)
@@ -402,6 +440,11 @@ static unsigned fat_scan_root(void)
     auto_size = 0;
     heap_cluster = 0;
     heap_size = 0;
+    config_cluster = 0;
+    config_size = 0;
+    sys_cluster = 0;
+    sys_size = 0;
+    boot_n = 0;
     puts_("--- root directory ---\n");
     while (c >= 2 && c < 0x0FFFFFF8u && guard++ < 10000) {
         unsigned s;
@@ -416,6 +459,17 @@ static unsigned fat_scan_root(void)
                 if (e[11] == 0x0F) continue; // LFN entry
                 if (e[11] & 0x08) continue;  // volume label
                 print_dirent(e);
+                if (!(e[11] & 0x10) && rd32(e + 28) > 0 && boot_n < BOOT_MAX) {
+                    int is_bin = e[8] == 'B' && e[9] == 'I' && e[10] == 'N';
+                    int is_lsp = e[8] == 'L' && e[9] == 'S' && e[10] == 'P';
+                    if (is_bin || is_lsp) {
+                        int j;
+                        for (j = 0; j < 11; j++) boot_name[boot_n][j] = (char)e[j];
+                        boot_clu[boot_n] = (rd16(e + 20) << 16) | rd16(e + 26);
+                        boot_size[boot_n] = rd32(e + 28);
+                        boot_n++;
+                    }
+                }
                 match = 1;
                 for (i = 0; i < 11; i++)
                     if (e[i] != (unsigned char)"AUTOEXECLSP"[i]) match = 0;
@@ -429,6 +483,20 @@ static unsigned fat_scan_root(void)
                 if (match && !(e[11] & 0x10)) {
                     heap_cluster = (rd16(e + 20) << 16) | rd16(e + 26);
                     heap_size = rd32(e + 28);
+                }
+                match = 1;
+                for (i = 0; i < 11; i++)
+                    if (e[i] != (unsigned char)"CONFIG  LSP"[i]) match = 0;
+                if (match && !(e[11] & 0x10)) {
+                    config_cluster = (rd16(e + 20) << 16) | rd16(e + 26);
+                    config_size = rd32(e + 28);
+                }
+                match = 1;
+                for (i = 0; i < 11; i++)
+                    if (e[i] != (unsigned char)"SYS     LSP"[i]) match = 0;
+                if (match && !(e[11] & 0x10)) {
+                    sys_cluster = (rd16(e + 20) << 16) | rd16(e + 26);
+                    sys_size = rd32(e + 28);
                 }
             }
             if (stop) return found;
@@ -624,6 +692,20 @@ static unsigned fat_create(const char *name83, unsigned size)
     return first;
 }
 
+// Delete a root file: mark its directory entry 0xE5 and free the
+// cluster chain. Returns 0 on success, -1 when not found.
+static int fat_delete(const char *name83)
+{
+    struct DirHit h;
+    fat_scan_create(name83, &h);
+    if (!h.found) return -1;
+    if (sd_read_block(h.lba, blk) != 0) return -1;
+    blk[h.off] = 0xE5;
+    if (sd_write_block(h.lba, blk) != 0) return -1;
+    if (h.cluster) fat_free_chain(h.cluster);
+    return 0;
+}
+
 // Sequential block walker over a file's cluster chain (Stage 3c).
 // img_walk_next() returns the LBA of the current block and advances.
 // Note it may call fat_next(), which reuses blk[] as scratch -- so
@@ -663,7 +745,7 @@ static int int_val(val v) { return v >> 1; }
 struct Cell { val car, cdr; };
 // NCELLS was 950 until Stage 3d; trimmed to fit the FAT write code
 // in the 32K RAM budget (named worlds on SD make up the difference).
-#define NCELLS 700
+#define NCELLS 2560
 static struct Cell cells[NCELLS] __attribute__((aligned(8))); // tagged pointers require 8-alignment
 static val car(val v) { return ((struct Cell *)v)->car; }
 static val cdr(val v) { return ((struct Cell *)v)->cdr; }
@@ -680,10 +762,18 @@ static void error_(const char *msg)
 // eval/apply/parse push every value that is alive only in a C local,
 // so cons() may run gc() when the heap runs dry, even mid-eval. ----
 #define NWORDS ((NCELLS + 31) / 32)
-#define NROOTS 256 // 512 until Stage 3d; trimmed for the 32K RAM budget
+#define NROOTS 1024 // 512 until Stage 3d; measured ~3.7 roots per eval level
 static val roots[NROOTS];
 static int nroots = 0;
-static void push_root(val v) { if (nroots < NROOTS) roots[nroots++] = v; }
+// Overflow must be loud, never silent: a dropped root lets the GC
+// sweep a live value, and eval() also writes roots[base] directly.
+// (Found by the SYS.LSP tests: non-tail recursion past depth ~64
+// silently corrupted the heap at NROOTS 256.)
+static void push_root(val v)
+{
+    if (nroots < NROOTS) roots[nroots++] = v;
+    else error_("root stack full");
+}
 static unsigned markbits[NWORDS];
 static unsigned usedbits[NWORDS];
 static val freelist = NIL;
@@ -743,7 +833,7 @@ static void gc_init(void)
 
 // ---------- symbols ----------
 struct Sym { char name[16]; };
-#define NSYMS 96
+#define NSYMS 192
 static struct Sym symtab[NSYMS] __attribute__((aligned(8)));
 static int nsyms = 0;
 static val sym_t, sym_quote, sym_if, sym_lambda, sym_define, sym_let,
@@ -992,10 +1082,96 @@ static val eval_list(val exprs, val env)
 #define PRIM_KEYS 30
 #define PRIM_ENC 31
 #define PRIM_RESTORE 32
+#define PRIM_DIR 33
+#define PRIM_DELETE_FILE 34
+#define PRIM_DUMP 35
 static val prim_load(const char *name);
+static val prim_dir(void);
+static int file_delete(const char *name);
 
 static int heap_save(void); // defined below, with the SD boot stage
 static int heap_restore(void); // likewise
+static int heap_dump_uart(void); // likewise
+static int world_name83(const char *name, char *n83); // defined below
+
+// (delete-file NAME): remove a root file and free its clusters.
+// Cached boot files (HEAPIMG/AUTOEXEC) are forgotten when deleted.
+static int file_delete(const char *name)
+{
+    char n83[12];
+    int i, same;
+    if (!sd_mounted) { puts_("delete-file: SD unavailable\n"); return -1; }
+    if (world_name83(name, n83) != 0) { puts_("delete-file: bad name\n"); return -1; }
+    if (fat_delete(n83) != 0) { puts_("delete-file: not found\n"); return -1; }
+    same = 1;
+    for (i = 0; i < 11; i++) if (n83[i] != "HEAPIMG BIN"[i]) same = 0;
+    if (same) heap_cluster = 0;
+    same = 1;
+    for (i = 0; i < 11; i++) if (n83[i] != "AUTOEXECLSP"[i]) same = 0;
+    if (same) auto_cluster = 0;
+    return 0;
+}
+
+
+#define DIR_MAX 16
+static char dir_names[DIR_MAX][11];
+
+// (dir): a list of the root directory's file names as symbols, in
+// directory order. Names are collected first (blk[] is scratch), then
+// the list is built with the head rooted across cons calls.
+static val prim_dir(void)
+{
+    unsigned c;
+    int guard = 0, n = 0, i;
+    val head = NIL;
+    int hslot;
+    if (!sd_mounted) return NIL;
+    c = fat_root_cluster;
+    while (c >= 2 && c < 0x0FFFFFF8u && guard++ < 10000) {
+        unsigned s;
+        int stop = 0;
+        for (s = 0; s < fat_spc; s++) {
+            int off;
+            if (n >= DIR_MAX) break;
+            if (sd_read_block(cluster_lba(c) + s, blk) != 0) return NIL;
+            for (off = 0; off < 512; off += 32) {
+                const unsigned char *e = blk + off;
+                int j;
+                if (e[0] == 0x00) { stop = 1; break; }
+                if (e[0] == 0xE5) continue;
+                if (e[11] == 0x0F) continue;
+                if (e[11] & 0x18) continue;
+                if (n < DIR_MAX) {
+                    for (j = 0; j < 11; j++) dir_names[n][j] = (char)e[j];
+                    n++;
+                }
+            }
+            if (stop) break;
+        }
+        if (stop || n >= DIR_MAX) break;
+        c = fat_next(c);
+    }
+    hslot = nroots;
+    push_root(NIL);
+    for (i = n - 1; i >= 0; i--) {
+        char dotted[16];
+        int end = 8, eend = 3, k = 0, j;
+        while (end > 0 && dir_names[i][end - 1] == ' ') end--;
+        for (j = 0; j < end; j++) dotted[k++] = dir_names[i][j];
+        if (dir_names[i][8] != ' ') {
+            dotted[k++] = '.';
+            while (eend > 0 && dir_names[i][8 + eend - 1] == ' ') eend--;
+            for (j = 0; j < eend; j++) dotted[k++] = dir_names[i][8 + j];
+        }
+        dotted[k] = 0;
+        head = cons(intern(dotted), head);
+        roots[hslot] = head;
+        if (lisp_err) break;
+    }
+    nroots = hslot;
+    return head;
+}
+
 static int world_save(const char *name);   // (save NAME.BIN), Stage 3d
 static int world_restore(const char *name); // (restore NAME.BIN), Stage 3d
 
@@ -1076,6 +1252,14 @@ static val apply_prim(int idx, val args)
         a = is_cons(args) ? car(args) : NIL;
         if (!is_sym(a)) { error_("load: need a file name symbol"); return NIL; }
         return prim_load(sym_name(a));
+    case PRIM_DIR:
+        return prim_dir();
+    case PRIM_DELETE_FILE:
+        a = is_cons(args) ? car(args) : NIL;
+        if (!is_sym(a)) { error_("delete-file: need a file name symbol"); return NIL; }
+        return file_delete(sym_name(a)) == 0 ? sym_t : NIL;
+    case PRIM_DUMP:
+        return mk_int(heap_dump_uart());
     case PRIM_MAKE_BYTES: {
         int n, fill = 0;
         if (!is_cons(args)) { error_("bad args"); return NIL; }
@@ -1240,9 +1424,23 @@ static val seq_last(val body, val env, int *empty)
 // operands, if condition, let init forms, set! value, non-last body
 // forms) goes through a nested eval() call, whose own trampoline keeps
 // its depth at one frame per non-tail nesting level.
+int eval_depth_max_seen = 0; // probe instrumentation (read via nm/JTAG)
+static int eval_depth = 0;
+// Non-tail recursion grows the C stack by one eval frame per level;
+// the root-stack guard alone cannot protect it. The limit keeps the
+// worst case inside the RAM slack (calibrated on hardware, PROG41).
+#define EVAL_DEPTH_MAX 64
 static val eval(val e, val env)
 {
     int base = nroots;
+    if (base + 2 > NROOTS) { error_("eval too deep"); return NIL; }
+    eval_depth++;
+    if (eval_depth > EVAL_DEPTH_MAX) {
+        eval_depth--;
+        error_("eval too deep");
+        return NIL;
+    }
+    if (eval_depth > eval_depth_max_seen) eval_depth_max_seen = eval_depth;
     push_root(e);
     push_root(env);
     for (;;) {
@@ -1428,6 +1626,7 @@ static val eval(val e, val env)
     {
         val r = lisp_err ? NIL : e;
         nroots = base;
+        eval_depth--;
         return r;
     }
 }
@@ -1447,7 +1646,7 @@ static val eval(val e, val env)
                            (unsigned)sizeof(usedbits))
 #define IMG_TOTAL_BLOCKS (1u + ((IMG_PAYLOAD_BYTES + 511u) >> 9))
 #define IMG_FILE_BYTES (IMG_TOTAL_BLOCKS << 9)
-#define IMG_VERSION 4u // bumped on every layout change (2: (load), 3: SPI prims, 4: NCELLS 800 / worlds)
+#define IMG_VERSION 12u // bumped on every layout change (2: (load), 3: SPI prims, 4: NCELLS 800 / worlds, 5: NCELLS 600 / boot launcher, 6: NCELLS 384 / F1 firmware services, 7: NCELLS 320 / stack margin, 8: NCELLS 288 / (dump) prim, 9: NCELLS 352 / NROOTS 96, 10: 64K RAM, NCELLS 2048 / NSYMS 128, 11: NSYMS 192, 12: NCELLS 2560 / eval depth limit)
 
 static void wr32(unsigned char *p, unsigned v)
 {
@@ -1491,11 +1690,12 @@ static int heap_file_ok(void)
     return 1;
 }
 
-static int heap_save_to(unsigned cluster)
+// Shared by heap_save_to() and heap_dump_uart(): the used-cell count
+// and the payload checksum, and the header block that carries them.
+// img_stats() also resets the payload cursor for the block loops.
+static void img_stats(unsigned *used_out, unsigned *cksum_out)
 {
-    struct ImgWalk w;
-    unsigned cksum = 0, used = 0, produced;
-    unsigned b, i;
+    unsigned cksum = 0, used = 0, b, i;
     img_cursor_init();
     for (b = 0; b < 3; b++)
         for (i = 0; i < img_reg_len[b]; i++)
@@ -1504,26 +1704,50 @@ static int heap_save_to(unsigned cluster)
         unsigned x = usedbits[i];
         while (x) { used += x & 1u; x >>= 1; }
     }
+    *used_out = used;
+    *cksum_out = cksum;
+}
+
+static void img_header(unsigned used, unsigned cksum)
+{
+    unsigned i;
+    for (i = 0; i < 512; i++) blk[i] = 0;
+    blk[0] = 'T'; blk[1] = 'L'; blk[2] = 'H'; blk[3] = 'P';
+    wr32(blk + 4, IMG_VERSION);
+    wr32(blk + 8, used);
+    wr32(blk + 12, (unsigned)nsyms);
+    wr32(blk + 16, (unsigned)genv);
+    wr32(blk + 20, cksum);
+    wr32(blk + 24, IMG_PAYLOAD_BYTES);
+}
+
+// Fill blk[] with image block b (header for b == 0, payload after).
+static void img_fill_block(unsigned b, unsigned used, unsigned cksum,
+                           unsigned *produced)
+{
+    unsigned i;
+    if (b == 0) {
+        img_header(used, cksum);
+        return;
+    }
+    for (i = 0; i < 512; i++) {
+        blk[i] = (unsigned char)(*produced < IMG_PAYLOAD_BYTES
+                                 ? img_src_byte() : 0);
+        if (*produced < IMG_PAYLOAD_BYTES) (*produced)++;
+    }
+}
+
+static int heap_save_to(unsigned cluster)
+{
+    struct ImgWalk w;
+    unsigned cksum = 0, used = 0, produced;
+    unsigned b, i;
+    img_stats(&used, &cksum);
     img_walk_init(&w, cluster);
     produced = 0;
     for (b = 0; b < IMG_TOTAL_BLOCKS; b++) {
         unsigned lba = img_walk_next(&w); // before touching blk[]
-        if (b == 0) {
-            for (i = 0; i < 512; i++) blk[i] = 0;
-            blk[0] = 'T'; blk[1] = 'L'; blk[2] = 'H'; blk[3] = 'P';
-            wr32(blk + 4, IMG_VERSION);
-            wr32(blk + 8, used);
-            wr32(blk + 12, (unsigned)nsyms);
-            wr32(blk + 16, (unsigned)genv);
-            wr32(blk + 20, cksum);
-            wr32(blk + 24, IMG_PAYLOAD_BYTES);
-        } else {
-            for (i = 0; i < 512; i++) {
-                blk[i] = (unsigned char)(produced < IMG_PAYLOAD_BYTES
-                                         ? img_src_byte() : 0);
-                if (produced < IMG_PAYLOAD_BYTES) produced++;
-            }
-        }
+        img_fill_block(b, used, cksum, &produced);
         if (sd_write_block(lba, blk) != 0) {
             puts_("save: block write failed\n");
             return -1;
@@ -1531,6 +1755,27 @@ static int heap_save_to(unsigned cluster)
     }
     puts_("save: heap image written\n");
     return 0;
+}
+
+// (dump): stream the heap image to the UART in the exact (save) byte
+// format, preceded by a marker line, for the companion app's world
+// viewer: "WORLD-BEGIN <total bytes>\n" then IMG_FILE_BYTES raw
+// bytes. Returns the used-cell count. No allocation happens inside,
+// so the snapshot is consistent.
+static int heap_dump_uart(void)
+{
+    unsigned cksum = 0, used = 0, produced;
+    unsigned b, i;
+    img_stats(&used, &cksum);
+    puts_("WORLD-BEGIN ");
+    putnum((int)IMG_FILE_BYTES);
+    putc_('\n');
+    produced = 0;
+    for (b = 0; b < IMG_TOTAL_BLOCKS; b++) {
+        img_fill_block(b, used, cksum, &produced);
+        for (i = 0; i < 512; i++) putc_((char)blk[i]);
+    }
+    return (int)used;
 }
 
 static int heap_save(void)
@@ -1716,30 +1961,13 @@ static val prim_load(const char *name)
 }
 
 // ---------- SD boot stage: mount, list root, restore or AUTOEXEC ----------
-static void sd_boot(void)
+// Run a .LSP file from the card as the boot script (AUTOEXEC semantics:
+// evaluate each top-level form in order, printing values).
+static void run_boot_lsp(unsigned clu, unsigned size)
 {
-    unsigned fc;
     int n;
-    if (fat_mount() != 0) {
-        puts_("SD: unavailable -- starting REPL only\n");
-        return;
-    }
-    sd_mounted = 1;
-    fc = fat_scan_root();
-    if (heap_cluster && heap_restore() == 0) {
-        puts_("HEAPIMG restored\n");
-        return;
-    }
-    if (!fc) {
-        puts_("AUTOEXEC.LSP not found\n");
-        return;
-    }
-    auto_cluster = fc;
-    puts_("AUTOEXEC.LSP found, ");
-    putnum((int)auto_size);
-    puts_(" bytes\n");
-    n = fat_load_buf(fc, auto_size, autobuf, AUTOBUF_SIZE);
-    if (n <= 0) { puts_("AUTOEXEC.LSP load failed\n"); return; }
+    n = fat_load_buf(clu, size, autobuf, AUTOBUF_SIZE);
+    if (n <= 0) { puts_("boot: load failed\n"); return; }
     rp = (const char *)autobuf;
     for (;;) {
         val e, r;
@@ -1757,6 +1985,150 @@ static void sd_boot(void)
     }
     lisp_err = 0;
     puts_("AUTOEXEC done\n");
+}
+
+// Look up a symbol's value in the global environment (CONFIG reading).
+static val env_lookup(val sym)
+{
+    val e = genv;
+    while (is_cons(e)) {
+        val pair = car(e);
+        if (is_cons(pair) && car(pair) == sym) return cdr(pair);
+        e = cdr(e);
+    }
+    return NIL;
+}
+
+// Evaluate a .LSP file without printing values (CONFIG.LSP / SYS.LSP).
+static void run_silent_lsp(unsigned clu, unsigned size, const char *tag)
+{
+    int n;
+    n = fat_load_buf(clu, size, autobuf, AUTOBUF_SIZE);
+    if (n <= 0) { puts_(tag); puts_(": load failed\n"); return; }
+    rp = (const char *)autobuf;
+    for (;;) {
+        val e;
+        skip_ws();
+        if (*rp == 0) break;
+        lisp_err = 0;
+        e = parse_val();
+        if (lisp_err) { puts_(tag); puts_(": parse error\n"); break; }
+        (void)eval(e, genv);
+        if (lisp_err) { puts_(tag); puts_(": eval error\n"); break; }
+        gc();
+    }
+    lisp_err = 0;
+}
+
+// Pull the boot settings out of the environment CONFIG.LSP populated:
+// MENU-TMO (fixnum seconds, 0..30) and BOOT-DEFAULT (a file symbol).
+static void read_config(void)
+{
+    val v;
+    cfg_menu_sec = 5;
+    cfg_has_default = 0;
+    v = env_lookup(intern("MENU-TMO"));
+    if (is_int(v)) {
+        int s = int_val(v);
+        if (s < 0) s = 0;
+        if (s > 30) s = 30;
+        cfg_menu_sec = s;
+    }
+    v = env_lookup(intern("BOOT-DEFAULT"));
+    if (is_sym(v)) {
+        char n83[12];
+        if (world_name83(sym_name(v), n83) == 0) {
+            int i;
+            for (i = 0; i < 11; i++) cfg_default83[i] = n83[i];
+            cfg_has_default = 1;
+        }
+    }
+}
+
+// Boot one launcher candidate. Returns 1 when boot is complete (a
+// world was restored or an app ran), 0 when a .BIN was not a valid
+// world and the caller should fall back to the default path.
+static int boot_dispatch(int sel)
+{
+    puts_("boot: ");
+    print_83name(boot_name[sel]);
+    putc_('\n');
+    if (boot_name[sel][8] == 'B') {  // .BIN: a saved world
+        if (heap_restore_from(boot_clu[sel], boot_size[sel]) == 0) {
+            puts_("boot: world restored\n");
+            return 1;
+        }
+        puts_("boot: not a valid world, using default\n");
+        return 0;
+    }
+    run_boot_lsp(boot_clu[sel], boot_size[sel]);  // .LSP: an app
+    return 1;
+}
+
+static void sd_boot(void)
+{
+    unsigned fc;
+    if (fat_mount() != 0) {
+        puts_("SD: unavailable -- starting REPL only\n");
+        return;
+    }
+    sd_mounted = 1;
+    fc = fat_scan_root();
+    // Firmware services first: CONFIG.LSP sets boot options, then
+    // SYS.LSP loads the system library (both silent, values hidden).
+    if (config_cluster) {
+        run_silent_lsp(config_cluster, config_size, "CONFIG");
+        read_config();
+    }
+    if (sys_cluster) run_silent_lsp(sys_cluster, sys_size, "SYS");
+    // Launcher: offer the .BIN worlds and .LSP apps found in the root.
+    // A digit selects one; any other key, or the timeout, takes the
+    // default path (BOOT-DEFAULT if configured, else the HEAPIMG
+    // world if valid, else AUTOEXEC.LSP).
+    if (boot_n > 0) {
+        int k, key = -1;
+        if (cfg_menu_sec > 0) {
+            puts_("--- boot menu: press a number (");
+            putnum(cfg_menu_sec);
+            puts_("s) ---\n");
+            for (k = 0; k < boot_n; k++) {
+                putnum(k + 1);
+                puts_(") ");
+                print_83name(boot_name[k]);
+                putc_('\n');
+            }
+            puts_("0) default\n");
+            key = boot_key_wait(cfg_menu_sec);
+        }
+        if (key >= '1' && key < '1' + boot_n) {
+            if (boot_dispatch(key - '1')) return;
+        }
+    }
+    if (cfg_has_default) {
+        int k;
+        for (k = 0; k < boot_n; k++) {
+            int i, same = 1;
+            for (i = 0; i < 11; i++)
+                if (boot_name[k][i] != cfg_default83[i]) same = 0;
+            if (same) {
+                if (boot_dispatch(k)) return;
+                break;
+            }
+        }
+    }
+    if (heap_cluster && heap_restore() == 0) {
+        puts_("HEAPIMG restored\n");
+        return;
+    }
+    if (!fc) {
+        puts_("AUTOEXEC.LSP not found\n");
+        return;
+    }
+    auto_cluster = fc;
+    puts_("AUTOEXEC.LSP found, ");
+    putnum((int)auto_size);
+    puts_(" bytes\n");
+    run_boot_lsp(fc, auto_size);
 }
 
 // ---------- REPL ----------
@@ -1797,7 +2169,8 @@ static const char *prim_names[] = {
     "null?", "pair?", "eq?", "not", "list", "print", "save", "load",
     "make-bytes", "bytes-ref", "bytes-set!", "bytes-length", "bytes?",
     "peek", "poke", "spi-cs", "spi-fast", "spi-byte", "ash",
-    "logand", "logior", "keys", "enc", "restore", 0
+    "logand", "logior", "keys", "enc", "restore", "dir", "delete-file",
+    "dump", 0
 };
 
 int main(void)
@@ -1806,6 +2179,17 @@ int main(void)
     static char expr[384];
     int i;
 
+#ifdef STACK_PAINT
+    // Probe build only: paint the stack region below the live frames
+    // so a JTAG readback after a deep-recursion run shows the exact
+    // high-water mark. _stack_top comes from link.ld (64K = 0x10000).
+    {
+        extern char _stack_top;
+        volatile unsigned *p = (volatile unsigned *)((char *)&_stack_top - 24576);
+        volatile unsigned *end = (volatile unsigned *)((char *)&_stack_top - 1024);
+        while (p < end) *p++ = 0xA5A5A5A5u;
+    }
+#endif
     puts_("\nTangLisp v2+SD -- a tiny Lisp on PicoRV32 / Tang Primer 25K\n");
     gc_init();
     sym_t = intern("t");

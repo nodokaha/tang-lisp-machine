@@ -1,5 +1,5 @@
-// TangLisp SoC + SPI/SD: PicoRV32 + 32KB BSRAM + UART + SPI master
-// RAM  : 0x00000000 - 0x00007FFF
+// TangLisp SoC + SPI/SD: PicoRV32 + 64KB BSRAM + UART + SPI master
+// RAM  : 0x00000000 - 0x0000FFFF
 // UART : 0x02000000 DATA (rw), 0x02000004 STATUS (bit0 rx_ready, bit1 tx_busy)
 // SPI  : 0x03000000 DATA (write starts an 8-bit mode-0 MSB-first transfer,
 //        read returns the received byte)
@@ -31,7 +31,7 @@ module top(input clk, output uart_tx, input uart_rx, output led,
   wire        mem_ready;
 
   reg mem_ready_r = 0;
-  wire ram_sel  = (mem_addr < 32'h0000_8000);
+  wire ram_sel  = (mem_addr < 32'h0001_0000);
   wire uart_sel = (mem_addr >= 32'h0200_0000) && (mem_addr < 32'h0201_0000);
   wire spi_sel  = (mem_addr >= 32'h0300_0000) && (mem_addr < 32'h0301_0000);
   always @(posedge clk)
@@ -57,18 +57,18 @@ module top(input clk, output uart_tx, input uart_rx, output led,
     .irq(8'b0)
   );
 
-  // ---- RAM: 4 byte banks x 8192 ----
-  reg [7:0] bank0 [0:8191];
-  reg [7:0] bank1 [0:8191];
-  reg [7:0] bank2 [0:8191];
-  reg [7:0] bank3 [0:8191];
+  // ---- RAM: 4 byte banks x 16384 ----
+  reg [7:0] bank0 [0:16383];
+  reg [7:0] bank1 [0:16383];
+  reg [7:0] bank2 [0:16383];
+  reg [7:0] bank3 [0:16383];
   initial begin
     $readmemh("fw0.hex", bank0);
     $readmemh("fw1.hex", bank1);
     $readmemh("fw2.hex", bank2);
     $readmemh("fw3.hex", bank3);
   end
-  wire [12:0] waddr = mem_addr[14:2];
+  wire [13:0] waddr = mem_addr[15:2];
   reg [31:0] ram_rdata = 0;
   always @(posedge clk) begin
     if (bus_fire && ram_sel) begin

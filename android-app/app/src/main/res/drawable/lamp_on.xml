@@ -1,0 +1,15 @@
+<?xml version="1.0" encoding="utf-8"?>
+<!-- Connection lamp, lit: a warm glow around an amber core. -->
+<layer-list xmlns:android="http://schemas.android.com/apk/res/android">
+    <item>
+        <shape android:shape="oval">
+            <solid android:color="@color/lamp_on_glow" />
+        </shape>
+    </item>
+    <item android:left="3dp" android:top="3dp" android:right="3dp" android:bottom="3dp">
+        <shape android:shape="oval">
+            <solid android:color="@color/lamp_on_core" />
+            <stroke android:width="1dp" android:color="@color/lamp_on_ring" />
+        </shape>
+    </item>
+</layer-list>

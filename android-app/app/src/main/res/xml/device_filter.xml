@@ -1,0 +1,6 @@
+<?xml version="1.0" encoding="utf-8"?>
+<resources>
+    <!-- Tang Primer 25K dock: BL616 enumerates as FTDI FT2232.
+         VID 0x0403 = 1027, PID 0x6010 = 24592. -->
+    <usb-device vendor-id="1027" product-id="24592" />
+</resources>

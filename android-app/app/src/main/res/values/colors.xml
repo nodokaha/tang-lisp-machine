@@ -1,0 +1,25 @@
+<?xml version="1.0" encoding="utf-8"?>
+<!-- Evening-room palette: warm dark surfaces, cream text, and the
+     connection state shown as lamplight (amber = lit, blue-grey = dark). -->
+<resources>
+    <color name="icon_background">#0A3D29</color>
+
+    <color name="room_bg">#16130E</color>
+    <color name="console_bg">#0C0F0C</color>
+    <color name="console_border">#2C362C</color>
+    <color name="console_text">#CFE3C0</color>
+
+    <color name="text_cream">#F2E7D3</color>
+    <color name="text_muted">#A89880</color>
+
+    <color name="accent">#D98E4A</color>
+    <color name="accent_text">#2A1A08</color>
+    <color name="key_bg">#262019</color>
+
+    <color name="lamp_on_core">#FFC06A</color>
+    <color name="lamp_on_glow">#59FFB45E</color>
+    <color name="lamp_on_ring">#8A5A1E</color>
+    <color name="lamp_off_core">#54687E</color>
+    <color name="lamp_off_glow">#3354687E</color>
+    <color name="lamp_off_ring">#2E3D4D</color>
+</resources>

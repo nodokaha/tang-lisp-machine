@@ -71,6 +71,8 @@ for c in (2, 3, 4):
 for c in range(5, 10):
     fat_set(c, c + 1)
 fat_set(10, 0x0FFFFFFF)
+fat_set(11, 0x0FFFFFFF)   # CONFIG.LSP
+fat_set(12, 0x0FFFFFFF)   # SYS.LSP
 for f in range(NFATS):
     for s in range(fatsz):
         put_sec(fat_begin + f*fatsz + s, fat[s*SECTOR:(s+1)*SECTOR])
@@ -94,6 +96,21 @@ buf = bytearray(SPC * SECTOR)
 buf[:5] = b"HELLO"
 for s in range(SPC):
     put_sec(clus_lba(4) + s, buf[s*SECTOR:(s+1)*SECTOR])
+
+# ---- CONFIG.LSP (cluster 11) / SYS.LSP (cluster 12) ----
+import sys
+config = b"(define MENU-TMO 2)\r\n"
+if len(sys.argv) > 1 and sys.argv[1] == "bootdefault":
+    config += b"(define BOOT-DEFAULT (quote W1.BIN))\r\n"
+buf = bytearray(SPC * SECTOR)
+buf[:len(config)] = config
+for s in range(SPC):
+    put_sec(clus_lba(11) + s, buf[s*SECTOR:(s+1)*SECTOR])
+syslsp = b"(define (sys-marker) 777)\r\n"
+buf = bytearray(SPC * SECTOR)
+buf[:len(syslsp)] = syslsp
+for s in range(SPC):
+    put_sec(clus_lba(12) + s, buf[s*SECTOR:(s+1)*SECTOR])
 
 # ---- root directory (cluster 2) ----
 def entry(name11, attr, cluster, size, first=None):
@@ -119,6 +136,8 @@ root[64:96] = entry(b"DELETED TXT", 0x20, 5, 123, first=0xE5)     # deleted (ski
 root[96:128] = entry(b"AUTOEXECLSP", 0x20, 3, len(autoexec))
 root[128:160] = entry(b"DUMMY   TXT", 0x20, 4, 5)
 root[160:192] = entry(b"HEAPIMG BIN", 0x20, 5, 12288)   # zero-filled clusters 5..10
+root[192:224] = entry(b"CONFIG  LSP", 0x20, 11, len(config))
+root[224:256] = entry(b"SYS     LSP", 0x20, 12, len(syslsp))
 # rest zeros = end marker
 for s in range(SPC):
     put_sec(clus_lba(2) + s, root[s*SECTOR:(s+1)*SECTOR])

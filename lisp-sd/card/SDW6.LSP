@@ -1,0 +1,10 @@
+; SDW6.LSP - UART byte io + (recv-file name83 len): receive a file
+(define(ug)(if(=(logand(peek 33554436)1)1)(peek 33554432)(ug)))
+(define(up c)(if(=(logand(peek 33554436)2)0)(poke 33554432 c)(up c)))
+(define(us l)(if(null? l)t(begin(up(car l))(us(cdr l)))))
+(define(ufl i n)(if(= i n)t(begin(bytes-set! buf i(ug))(ufl(+ i 1)n))))
+(define(stc l s left)(if(= s 0)t(if(> left 0)(let((n(if(> left 512)512 left)))(begin(ufl 0 n)(wr l buf)(stc(+ l 1)(- s 1)(- left n))))t)))
+(define(stm cs left)(if(null? cs)t(begin(stc(clba(car cs))spc left)(stm(cdr cs)(- left(* spc 512))))))
+(define(nc1 a b)(if(< a b)1(+ 1(nc1(- a b)b))))
+(define(ncl len)(if(< len 1)1(nc1 len(* spc 512))))
+(define(recv-file n len)(mnt)(let((hit(dscan n)))(if(null? hit)()(begin(if(=(car hit)1)(fch(car(cdr(cdr(cdr hit)))))t)(let((cs(alc(ncl len)2 0)))(if(null? cs)()(begin(ew(car(cdr hit))(car(cdr(cdr hit)))n(car cs)len)(us(list 83 84 79 82 69 45 82 69 65 68 89 10))(stm cs len)(car cs))))))))

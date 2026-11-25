@@ -216,6 +216,30 @@ soc.bin は 808,552 バイト、MD5 `4b76572c452271957377cee3a186e53c`
 0x0001281b を確認済み。PROG35 版は `e993cacfe0729bde0400f07da7ba2b10`、
 3c 版は `022568d6e00cd35da59af7a04f758d1b`）
 
+PROG40（(dump) プリミティブ、IMG_VERSION 8、NCELLS 288）:
+soc.bin MD5 `db4f88c77e5e8efc3aa300aed1714ae9`、soc_flash.bin MD5
+`73bf644873d9b98b32c6e5d9e461bb11`。text 21,325 + data 4 + bss 9,076
+= 30,405、スタック余裕 2,363B。SRAM 実機検証済み（(dump) で生きた
+世界を UART へ流し、チェックサム・束縛まで確認）。2026-11-25 に
+フラッシュ焼き込み完了（VERIFY OK、単体起動＋(dump) 確認済み）。
+
+PROG41（64KB RAM 化＋ルートスタック修正＋Lisp SD ライタ対応、
+IMG_VERSION 12、NCELLS 2560 / NSYMS 192 / NROOTS 1024）:
+soc.bin MD5 `1013aa2ff52c5cc540ca3b0c2201c864`、soc_flash.bin MD5
+`1a110be931dd6e6040743251135eaf0f`。text 21,449 + data 4 + bss 33,076
+= 54,529、スタック余裕 11,007B。変更点3つ。(1) SoC の RAM を
+32KB→64KB（BSRAM 32/56 ブロック、99.45MHz PASS）。ヒープ不足で
+ライブラリ常駐も SDREAD 級ドライバも載らなかった問題を解消。
+(2) **ルートスタック溢れの無言破壊を修正**：旧版は push_root が
+溢れると根を黙って捨て、深い非末尾再帰（目安40段超）でヒープが
+静かに壊れた（PROG40 も該当）。溢れはエラーにし、eval 入口の
+ガードと評価深度上限（EVAL_DEPTH_MAX 64、暫定値）を追加。
+(3) SD 書き込みは C でなく **Lisp ドライバ**（card/SDW1〜6.LSP、
+SDREAD の対。SPI プリミティブ越しに FAT32 へ新規作成・置換）。
+ホスト検証済み（作成・置換ともバイト一致、C 側 (dir)/(load) と
+相互運用、SDREAD 回帰 t/85/170/12/12）。SYS.LSP は fold 中心の
+全末尾再帰版に刷新。SRAM 実機検証はこれから。
+
 コンパイラ注意：RISC-V ツールチェーンは VM 入れ替えで消える。
 現在のものは `apt install gcc-riscv64-unknown-elf`（13.2.0、
 再取得に約11分）。以前のツールチェーンより -Os の text が約2KB

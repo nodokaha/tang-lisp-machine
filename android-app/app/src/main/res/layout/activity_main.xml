@@ -1,0 +1,166 @@
+<?xml version="1.0" encoding="utf-8"?>
+<LinearLayout xmlns:android="http://schemas.android.com/apk/res/android"
+    android:layout_width="match_parent"
+    android:layout_height="match_parent"
+    android:orientation="vertical"
+    android:background="@color/room_bg"
+    android:padding="12dp">
+
+    <LinearLayout
+        android:layout_width="match_parent"
+        android:layout_height="wrap_content"
+        android:orientation="horizontal"
+        android:gravity="center_vertical">
+
+        <!-- Connection state as lamplight: amber when lit, blue-grey when dark. -->
+        <View
+            android:id="@+id/statusLamp"
+            android:layout_width="16dp"
+            android:layout_height="16dp"
+            android:layout_marginEnd="8dp"
+            android:background="@drawable/lamp_off" />
+
+        <TextView
+            android:id="@+id/statusText"
+            android:layout_width="0dp"
+            android:layout_height="wrap_content"
+            android:layout_weight="1"
+            android:text="Not connected"
+            android:textColor="@color/text_cream"
+            android:textSize="14sp" />
+
+        <Button
+            android:id="@+id/connectButton"
+            android:layout_width="wrap_content"
+            android:layout_height="wrap_content"
+            android:backgroundTint="@color/accent"
+            android:textColor="@color/accent_text"
+            android:text="Connect" />
+    </LinearLayout>
+
+    <!-- Action row: three equal-width buttons. Keeping these out of
+         the status row — four buttons beside the status text crushed
+         it to zero width and clipped the last button off-screen. -->
+    <LinearLayout
+        android:layout_width="match_parent"
+        android:layout_height="wrap_content"
+        android:orientation="horizontal"
+        android:layout_marginTop="8dp">
+
+        <Button
+            android:id="@+id/worldButton"
+            android:layout_width="0dp"
+            android:layout_height="wrap_content"
+            android:layout_weight="1"
+            android:backgroundTint="@color/key_bg"
+            android:textColor="@color/text_cream"
+            android:text="World" />
+
+        <Button
+            android:id="@+id/sendFileButton"
+            android:layout_width="0dp"
+            android:layout_height="wrap_content"
+            android:layout_weight="1"
+            android:layout_marginStart="8dp"
+            android:backgroundTint="@color/key_bg"
+            android:textColor="@color/text_cream"
+            android:text="Send file" />
+
+        <Button
+            android:id="@+id/flashButton"
+            android:layout_width="0dp"
+            android:layout_height="wrap_content"
+            android:layout_weight="1"
+            android:layout_marginStart="8dp"
+            android:backgroundTint="@color/key_bg"
+            android:textColor="@color/text_cream"
+            android:text="Flash" />
+    </LinearLayout>
+
+    <!-- Flash progress: only visible while a burn runs. -->
+    <ProgressBar
+        android:id="@+id/flashProgress"
+        style="?android:attr/progressBarStyleHorizontal"
+        android:layout_width="match_parent"
+        android:layout_height="wrap_content"
+        android:layout_marginTop="8dp"
+        android:max="100"
+        android:progress="0"
+        android:progressTint="@color/accent"
+        android:visibility="gone" />
+
+    <ScrollView
+        android:id="@+id/consoleScroll"
+        android:layout_width="match_parent"
+        android:layout_height="0dp"
+        android:layout_weight="1"
+        android:layout_marginTop="8dp"
+        android:background="@drawable/console_bg">
+
+        <TextView
+            android:id="@+id/consoleText"
+            android:layout_width="match_parent"
+            android:layout_height="wrap_content"
+            android:fontFamily="monospace"
+            android:textColor="@color/console_text"
+            android:textSize="13sp"
+            android:padding="8dp" />
+    </ScrollView>
+
+    <LinearLayout
+        android:layout_width="match_parent"
+        android:layout_height="wrap_content"
+        android:orientation="horizontal"
+        android:layout_marginTop="8dp">
+
+        <EditText
+            android:id="@+id/inputField"
+            android:layout_width="0dp"
+            android:layout_height="wrap_content"
+            android:layout_weight="1"
+            android:hint="(define x 42)"
+            android:textColor="@color/text_cream"
+            android:textColorHint="@color/text_muted"
+            android:backgroundTint="@color/accent"
+            android:imeOptions="actionSend"
+            android:inputType="text"
+            android:importantForAutofill="no" />
+
+        <Button
+            android:id="@+id/sendButton"
+            android:layout_width="wrap_content"
+            android:layout_height="wrap_content"
+            android:backgroundTint="@color/accent"
+            android:textColor="@color/accent_text"
+            android:text="Send" />
+    </LinearLayout>
+
+    <!-- Boot-launcher keys: a digit selects a menu entry on the board,
+         Enter confirms lines at the REPL. Digits are sent without newline. -->
+    <LinearLayout
+        android:layout_width="match_parent"
+        android:layout_height="wrap_content"
+        android:orientation="horizontal"
+        android:layout_marginTop="4dp">
+
+        <Button android:id="@+id/key1" style="?android:attr/buttonStyleSmall" android:layout_width="0dp" android:layout_height="wrap_content" android:layout_weight="1" android:backgroundTint="@color/key_bg" android:textColor="@color/text_cream" android:text="1" />
+        <Button android:id="@+id/key2" style="?android:attr/buttonStyleSmall" android:layout_width="0dp" android:layout_height="wrap_content" android:layout_weight="1" android:backgroundTint="@color/key_bg" android:textColor="@color/text_cream" android:text="2" />
+        <Button android:id="@+id/key3" style="?android:attr/buttonStyleSmall" android:layout_width="0dp" android:layout_height="wrap_content" android:layout_weight="1" android:backgroundTint="@color/key_bg" android:textColor="@color/text_cream" android:text="3" />
+        <Button android:id="@+id/key4" style="?android:attr/buttonStyleSmall" android:layout_width="0dp" android:layout_height="wrap_content" android:layout_weight="1" android:backgroundTint="@color/key_bg" android:textColor="@color/text_cream" android:text="4" />
+        <Button android:id="@+id/key5" style="?android:attr/buttonStyleSmall" android:layout_width="0dp" android:layout_height="wrap_content" android:layout_weight="1" android:backgroundTint="@color/key_bg" android:textColor="@color/text_cream" android:text="5" />
+    </LinearLayout>
+
+    <LinearLayout
+        android:layout_width="match_parent"
+        android:layout_height="wrap_content"
+        android:orientation="horizontal">
+
+        <Button android:id="@+id/key6" style="?android:attr/buttonStyleSmall" android:layout_width="0dp" android:layout_height="wrap_content" android:layout_weight="1" android:backgroundTint="@color/key_bg" android:textColor="@color/text_cream" android:text="6" />
+        <Button android:id="@+id/key7" style="?android:attr/buttonStyleSmall" android:layout_width="0dp" android:layout_height="wrap_content" android:layout_weight="1" android:backgroundTint="@color/key_bg" android:textColor="@color/text_cream" android:text="7" />
+        <Button android:id="@+id/key8" style="?android:attr/buttonStyleSmall" android:layout_width="0dp" android:layout_height="wrap_content" android:layout_weight="1" android:backgroundTint="@color/key_bg" android:textColor="@color/text_cream" android:text="8" />
+        <Button android:id="@+id/key9" style="?android:attr/buttonStyleSmall" android:layout_width="0dp" android:layout_height="wrap_content" android:layout_weight="1" android:backgroundTint="@color/key_bg" android:textColor="@color/text_cream" android:text="9" />
+        <Button android:id="@+id/key0" style="?android:attr/buttonStyleSmall" android:layout_width="0dp" android:layout_height="wrap_content" android:layout_weight="1" android:backgroundTint="@color/key_bg" android:textColor="@color/text_cream" android:text="0" />
+        <Button android:id="@+id/keyEnter" style="?android:attr/buttonStyleSmall" android:layout_width="0dp" android:layout_height="wrap_content" android:layout_weight="1" android:backgroundTint="@color/key_bg" android:textColor="@color/text_cream" android:text="⏎" />
+    </LinearLayout>
+
+</LinearLayout>

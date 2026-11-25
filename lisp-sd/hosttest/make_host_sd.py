@@ -4,6 +4,7 @@ src = src.replace('#define UART_DATA (*(volatile unsigned int *)0x02000000u)\n#d
  '#include <stdio.h>\n#include <stdlib.h>\nstatic unsigned int uart_dummy_data, uart_dummy_stat;\n#define UART_DATA uart_dummy_data\n#define UART_STAT uart_dummy_stat')
 src = re.sub(r'static void putc_\(char c\)\n\{.*?\n\}', 'static void putc_(char c) { fputc(c, stdout); fflush(stdout); }', src, flags=re.S)
 src = re.sub(r'static int getc_\(void\)\n\{.*?\n\}', 'static int getc_(void) { int c = getchar(); if (c == EOF) exit(0); return c; }', src, flags=re.S)
+src = re.sub(r'static int boot_key_wait\(int sec\)\n\{.*?\n\}', '#include <sys/select.h>\n#include <sys/time.h>\nstatic int boot_key_wait(int sec)\n{\n    fd_set rf; struct timeval tv; int i;\n    for (i = 0; i < sec * 10; i++) {\n        FD_ZERO(&rf); FD_SET(0, &rf);\n        tv.tv_sec = 0; tv.tv_usec = 100000;\n        if (select(1, &rf, 0, 0, &tv) > 0) return getchar();\n    }\n    return -1;\n}', src, flags=re.S)
 # swap SD low-level for image-backed version
 host_low = r'''
 static int sd_ccs = 1;
@@ -122,9 +123,31 @@ static int emu_xfer(int b)
     return out;
 }
 static void lisp_spi_cs(int a);
+#include <poll.h>
+static int uart_stash = -1;
+static int uart_rx_ready(void)
+{
+    struct pollfd pfd;
+    int c;
+    if (uart_stash >= 0) return 1;
+    pfd.fd = 0; pfd.events = POLLIN; pfd.revents = 0;
+    if (poll(&pfd, 1, 0) > 0 && (pfd.revents & POLLIN)) {
+        c = getchar();
+        if (c == EOF) return 0;
+        uart_stash = c;
+        return 1;
+    }
+    return 0;
+}
 static int lisp_peek(unsigned addr)
 {
-    if (addr == 0x02000004u) return 2;
+    if (addr == 0x02000004u) return uart_rx_ready() ? 1 : 0;
+    if (addr == 0x02000000u) {
+        int c;
+        if (uart_stash < 0 && !uart_rx_ready()) return 0;
+        c = uart_stash; uart_stash = -1;
+        return c < 0 ? 0 : c;
+    }
     if (addr == 0x03000004u) return 0;
     if (addr == 0x03000008u) return emu_cs ? 1 : 0;
     if (addr == 0x03000000u) return emu_xfer(0xFF);
@@ -132,6 +155,7 @@ static int lisp_peek(unsigned addr)
 }
 static void lisp_poke(unsigned addr, unsigned v)
 {
+    if (addr == 0x02000000u) { fputc((int)(v & 0xFFu), stdout); fflush(stdout); return; }
     if (addr == 0x03000008u) { lisp_spi_cs((v & 1u) != 0); return; }
     if (addr == 0x03000000u) { emu_xfer((int)(v & 0xFFu)); return; }
 }
